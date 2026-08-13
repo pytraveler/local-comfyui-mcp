@@ -121,6 +121,43 @@ narrows the set - a switched-off tool is not registered at all, so its schema
 never reaches the model's context. What is off is reported by `comfy_status`, so
 the assistant does not conclude the server cannot do it.
 
+## Security
+
+The server, ComfyUI and the browser tab all run on your own machine, under your
+own account, over stdio. Nothing leaves it except the model downloads you ask
+for. What follows is what that still leaves open, because "it runs locally" is
+not the whole answer.
+
+**The download is the sharp end.** A model URL routinely arrives from somebody
+else's document - a "Model Links" note inside a shared workflow, or a loader's
+`properties.models` - reaches the assistant as ordinary text, and the assistant
+has a downloader. So `download_model` refuses three things before it opens a
+socket, and refuses a `dry_run` the same way:
+
+- **A host you did not allow.** `COMFYUI_DOWNLOAD_ALLOW_HOSTS` ships non-empty.
+  An injected instruction can name any URL; it cannot name a host that is not on
+  the list.
+- **A format that executes as it loads.** `.ckpt .pt .pth .bin .pkl` are pickle;
+  `.safetensors` and `.gguf` are data. Refused unless
+  `COMFYUI_DOWNLOAD_ALLOW_PICKLE` says otherwise.
+- **A file the volume cannot hold**, plus a ceiling of your own if you want one.
+
+A download token, if you set one, reaches the origin host and no further: the
+redirect chain is walked by hand so that a signed CDN link never sees it.
+
+**There is no authentication by default, and ComfyUI has none either.** On
+localhost that is the posture you already have. If ComfyUI listens wider than
+that, set `COMFYUI_BRIDGE_TOKEN` here and `COMFYUI_MCP_BRIDGE_TOKEN` in
+ComfyUI's own environment - the bridge adds routes to ComfyUI's server, and one
+of them restarts the process.
+
+**The tool switch is not a security boundary**, and the tool descriptions say so.
+`configure.bat` decides what is offered, which is a coarse grid: the question
+about `download_model` is not whether it exists but where it may point, and that
+is what the settings above are for. Your MCP client's own permission prompts are
+the other half.
+
+
 ## Workflows
 
 Workflow files live in `workflows/` and must be **API format** -

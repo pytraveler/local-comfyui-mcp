@@ -1,0 +1,8 @@
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh text eol=lf
+
+comfy_node/comfyui_mcp_bridge/src/mcp_bridge.js text eol=lf
+comfy_node/comfyui_mcp_bridge/web/mcp_bridge.js text eol=lf linguist-generated=true
+

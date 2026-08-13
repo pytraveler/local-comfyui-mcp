@@ -1,0 +1,72 @@
+# Publish a release when a version tag is pushed.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+# 
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: The tag and pyproject must agree
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
+          echo "tag $GITHUB_REF_NAME -> $tagged, pyproject says $declared"
+          if [ "$tagged" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $declared in pyproject.toml"
+            exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build the environment
+        run: uv sync
+
+      - name: Run the suite
+        run: uv run python -m pytest -q -rs
+
+      - name: Pack the archive
+        run: |
+          name="comfyui-mcp-${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          git archive --worktree-attributes --format=zip \
+            --prefix="$name/" -o "dist/$name.zip" "$GITHUB_REF_NAME"
+          unzip -l "dist/$name.zip" | tail -1
+          echo "ARCHIVE=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - name: Nothing in it that should not be
+        run: |
+          listed=$(unzip -Z1 "$ARCHIVE")
+          for bad in "src/mcp_bridge\.js" "minify_bridge\." "make_release\.py" \
+                     "README_dev\.md" "CLAUDE\.md" "/\.mcp\.json" "kilo\.jsonc" \
+                     "opencode\.jsonc" "/\.env$"; do
+            if echo "$listed" | grep -qE -- "$bad"; then
+              echo "::error::$ARCHIVE contains something matching $bad"
+              exit 1
+            fi
+          done
+          echo "$listed" | grep -q "comfy_node/comfyui_mcp_bridge/web/mcp_bridge.js" \
+            || { echo "::error::the built bridge is missing from the archive"; exit 1; }
+          echo "checked: the build is in, the sources and the private files are not"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ARCHIVE" --generate-notes

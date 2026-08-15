@@ -767,6 +767,7 @@ WORKSPACE_TOOLS = [
     "get_console_log",
     "diagnose_workspace",
     "navigate_workspace",
+    "switch_workspace_tab",
     "set_workspace_selection",
     "set_workspace_values",
     "set_workspace_node_modes",
@@ -1554,6 +1555,42 @@ async def navigate_workspace(to: str = "root", client_id: str = "") -> dict[str,
         raise ComfyError(f"to is required: {', '.join(NAVIGATION)}, or a subgraph node id")
 
     reply = await BRIDGE.call("navigate", {"to": str(to)}, client_id=client_id)
+    result = reply.get("result") or {}
+    return {"client_id": reply.get("client_id"), **result}
+
+
+@tool("workspace", "reads")
+async def switch_workspace_tab(
+    to: str = "", force: bool = False, client_id: str = ""
+) -> dict[str, Any]:
+    """List the workflow tabs open in the ComfyUI window, and switch between them.
+
+    These are the tabs along the top of ComfyUI: open workflows, exactly one of
+    which is on screen. They are not browser tabs - one browser tab holds all of
+    them, and `client_id` plus workspace_status is where that sense of the word
+    lives.
+
+    With no `to` it reports and moves nothing, which is also how to find out what
+    is open before naming one. Every other workspace tool acts on the workflow
+    that is on screen, so this is what points them at a different one.
+
+    Switching does what clicking the tab does, and no more: the canvas is
+    reloaded from that workflow's own stored state. Unsaved edits in the tab
+    being left behind are not lost - they belong to that workflow, which is why
+    a tab can report `modified` while a different one is on screen.
+
+    Args:
+        to: which tab - an index from a previous call, its path or its filename,
+            or "next", "previous", or "recent" for the one active before this.
+            Empty reports without moving. A name matching two open tabs is
+            refused rather than guessed.
+        force: reload the tab already on screen instead of reporting that it is
+            already there.
+        client_id: which browser tab to ask; defaults to the most recently focused.
+    """
+    reply = await BRIDGE.call(
+        "tabs", {"to": str(to), "force": bool(force)}, client_id=client_id
+    )
     result = reply.get("result") or {}
     return {"client_id": reply.get("client_id"), **result}
 

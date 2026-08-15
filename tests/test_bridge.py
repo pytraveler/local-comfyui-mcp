@@ -494,6 +494,50 @@ def test_navigating_nowhere_is_refused():
         run(S.navigate_workspace(""))
 
 
+def tabs_call(monkeypatch: pytest.MonkeyPatch, seen: list[dict[str, Any]]) -> None:
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return json_response(
+            200,
+            {"client_id": "tab-1", "result": {"moved": None, "active": None, "count": 0, "tabs": []}},
+        )
+
+    as_workspace(monkeypatch, routed(**ALIVE, **ONE_TAB, call=capture))
+
+
+def test_reporting_the_workflow_tabs_moves_nothing(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    tabs_call(monkeypatch, seen)
+    run(S.switch_workspace_tab())
+    assert seen[0]["method"] == "tabs"
+    assert seen[0]["params"] == {"to": "", "force": False}
+
+
+def test_switching_a_workflow_tab_passes_the_target_through(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    tabs_call(monkeypatch, seen)
+    run(S.switch_workspace_tab(to="next", force=True))
+    assert seen[0]["params"] == {"to": "next", "force": True}
+
+
+def test_a_workflow_tab_is_not_a_browser_tab(monkeypatch):
+    """Two different things wear the word "tab", and they travel in different keys.
+
+    `client_id` picks the browser tab to ask; `to` picks the workflow inside it.
+    Sending one where the other belongs would switch something nobody asked about,
+    and nothing in the reply would say so.
+    """
+    seen: list[dict[str, Any]] = []
+    tabs_call(monkeypatch, seen)
+    run(S.switch_workspace_tab(to="2", client_id="tab-1"))
+    assert seen[0]["params"]["to"] == "2"
+    assert seen[0]["client_id"] == "tab-1"
+
+
+def test_the_tab_switcher_is_offered_with_the_other_workspace_tools():
+    assert "switch_workspace_tab" in S.WORKSPACE_TOOLS
+
+
 def test_diagnosis_defaults_to_the_whole_workflow(monkeypatch):
     """Checking only the top level would pass a graph that cannot run."""
     seen: dict[str, Any] = {}

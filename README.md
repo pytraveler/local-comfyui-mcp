@@ -2,11 +2,11 @@
 
 **An MCP server that drives a local ComfyUI - including the workflow you have open in the browser.**
 
-[English](README.md) | [Русский](README.ru.md)
+[English](README.md) | [Русский](README.ru.md) | [Changelog](CHANGELOG.md)
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
-![Tools](https://img.shields.io/badge/tools-44-green)
+![Tools](https://img.shields.io/badge/tools-45-green)
 
 ---
 
@@ -103,14 +103,14 @@ copy to drift. No administrator rights needed.
 that, opening a tab is all it takes; `workspace_status` says whether both halves
 are in place.
 
-## What the 44 tools cover
+## What the 45 tools cover
 
 | Group | What it is for |
 |---|---|
 | **Status** | is ComfyUI up, what is the VRAM and the queue doing |
 | **Workflows and reference** | list workflow files, work out their parameters, search the node catalogue, read a node's schema |
 | **Logs** | ComfyUI's own console, and the browser console - where a failed extension is the only place it says anything |
-| **Canvas: reading** | the live graph, a screenshot of it, a diagnosis of what is wrong with it |
+| **Canvas: reading** | the live graph, a screenshot of it, which workflow tabs are open, a diagnosis of what is wrong with it |
 | **Canvas: editing** | widget values, properties, on-screen labels, links, node modes, layout, groups, undo |
 | **Running** | run a file or the canvas, follow the progress, fetch the result, show an image |
 | **Downloading models** | fetch a model to the directory ComfyUI actually reads, with progress |

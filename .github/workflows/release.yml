@@ -31,6 +31,21 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match version $declared in pyproject.toml"
             exit 1
           fi
+          echo "VERSION=$tagged" >> "$GITHUB_ENV"
+
+      - name: Release notes out of the changelogs
+        run: |
+          section() {
+            awk -v v="$VERSION" '$1 == "##" && $2 == v {f=1; next} f && $1 == "##" {exit} f {print}' "$1"
+          }
+          section CHANGELOG.md > /tmp/en.md
+          section CHANGELOG.ru.md > /tmp/ru.md
+          if [ ! -s /tmp/en.md ] || [ ! -s /tmp/ru.md ]; then
+            echo "::error::no section for $VERSION in CHANGELOG.md or CHANGELOG.ru.md"
+            exit 1
+          fi
+          { cat /tmp/en.md; echo; echo "---"; echo; cat /tmp/ru.md; } > /tmp/notes.md
+          cat /tmp/notes.md
 
       - uses: astral-sh/setup-uv@v5
         with:
@@ -44,12 +59,13 @@ jobs:
 
       - name: Pack the archive
         run: |
-          name="comfyui-mcp-${GITHUB_REF_NAME#v}"
+          name="comfyui-mcp-$VERSION"
           mkdir -p dist
           git archive --worktree-attributes --format=zip \
             --prefix="$name/" -o "dist/$name.zip" "$GITHUB_REF_NAME"
           unzip -l "dist/$name.zip" | tail -1
           echo "ARCHIVE=dist/$name.zip" >> "$GITHUB_ENV"
+          echo "PREFIX=$name" >> "$GITHUB_ENV"
 
       - name: Nothing in it that should not be
         run: |
@@ -62,11 +78,20 @@ jobs:
               exit 1
             fi
           done
-          echo "$listed" | grep -q "comfy_node/comfyui_mcp_bridge/web/mcp_bridge.js" \
-            || { echo "::error::the built bridge is missing from the archive"; exit 1; }
-          echo "checked: the build is in, the sources and the private files are not"
+          for needed in comfy_node/comfyui_mcp_bridge/web/mcp_bridge.js \
+                        CHANGELOG.md CHANGELOG.ru.md README.md README.ru.md LICENSE; do
+            echo "$listed" | grep -qxF -- "$PREFIX/$needed" || {
+              echo "::error::$needed is missing from $ARCHIVE"
+              exit 1
+            }
+          done
+          echo "checked: the build and the documents are in, the sources and the private files are not"
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$ARCHIVE" --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ARCHIVE" \
+            --title "comfyui-mcp $VERSION" \
+            --notes-file /tmp/notes.md \
+            --verify-tag

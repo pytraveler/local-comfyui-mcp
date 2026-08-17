@@ -136,7 +136,7 @@ def test_a_launch_script_reaching_out_of_the_root_is_an_error(tmp_path: Path):
     values = CC.read_env(root / ".env") if (root / ".env").is_file() else {}
     values = {**values, "COMFYUI_ROOT": str(root)}
 
-    for escape in (str(tmp_path / "elsewhere.bat"), "..\\elsewhere.bat"):
+    for escape in (str(tmp_path / "elsewhere.bat"), "../elsewhere.bat"):
         problems = CC.check({**values, "COMFYUI_LAUNCH_SCRIPT": escape})
         escaped = [p for p in problems if p.key == "COMFYUI_LAUNCH_SCRIPT" and p.severity == "error"]
         assert escaped, escape

@@ -24,7 +24,10 @@ COMFYUI_PORT=8188
 # Корень portable-сборки: та папка, где лежат ComfyUI\ и run_nvidia_gpu.bat.
 COMFYUI_ROOT=V:\Programs\Comfy\Comfyui_portable
 
-# .bat внутри COMFYUI_ROOT, которым запускается ComfyUI (инструмент comfy_start).
+# Скрипт внутри COMFYUI_ROOT, которым запускается ComfyUI (инструмент comfy_start).
+# .bat, .cmd, .ps1 или .sh - .ps1 запускается через PowerShell с -ExecutionPolicy
+# Bypass, а он действует на один процесс и на машине не меняет ничего.
+# Это должен быть файл внутри COMFYUI_ROOT: путь наружу отклоняется.
 COMFYUI_LAUNCH_SCRIPT=run_nvidia_gpu.bat
 
 # Где лежат workflow-файлы в API-формате. По умолчанию - workflows\ в репозитории.

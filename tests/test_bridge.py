@@ -536,6 +536,127 @@ def test_a_workflow_tab_is_not_a_browser_tab(monkeypatch):
 
 def test_the_tab_switcher_is_offered_with_the_other_workspace_tools():
     assert "switch_workspace_tab" in S.WORKSPACE_TOOLS
+    assert "close_workspace_tab" in S.WORKSPACE_TOOLS
+
+
+def test_a_blank_tab_is_asked_for_by_name_like_any_other_target(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    tabs_call(monkeypatch, seen)
+    run(S.switch_workspace_tab(to="new"))
+    assert seen[0]["method"] == "tabs"
+    assert seen[0]["params"]["to"] == "new"
+
+
+def closing_call(monkeypatch: pytest.MonkeyPatch, seen: list[dict[str, Any]], result=None) -> None:
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return json_response(200, {"client_id": "tab-1", "result": result or {"closed": "a.json"}})
+
+    as_workspace(monkeypatch, routed(**ALIVE, **ONE_TAB, call=capture))
+
+
+def test_closing_reaches_its_own_method_rather_than_the_switcher(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    closing_call(monkeypatch, seen)
+    run(S.close_workspace_tab(tab="2", force=True))
+    assert seen[0]["method"] == "close_tab"
+    assert seen[0]["params"] == {"tab": "2", "force": True}
+
+
+def test_closing_nothing_in_particular_means_the_tab_on_screen(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    closing_call(monkeypatch, seen)
+    run(S.close_workspace_tab())
+    assert seen[0]["params"] == {"tab": "", "force": False}
+
+
+def test_discarded_work_is_said_out_loud(monkeypatch):
+    """Losing unsaved work to a flag the caller passed is worth a sentence, not a field."""
+    seen: list[dict[str, Any]] = []
+    closing_call(
+        monkeypatch,
+        seen,
+        result={"closed": "sketch.json", "discarded_unsaved_changes": True},
+    )
+    closed = run(S.close_workspace_tab(tab="sketch", force=True))
+    assert "sketch.json" in closed["note"]
+    assert "gone" in closed["note"]
+
+
+def promoting_call(monkeypatch: pytest.MonkeyPatch, seen: list[dict[str, Any]]) -> None:
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return json_response(200, {"client_id": "tab-1", "result": {"changed": []}})
+
+    as_workspace(monkeypatch, routed(**ALIVE, **ONE_TAB, call=capture))
+
+
+def test_promotion_carries_both_maps_in_one_call(monkeypatch):
+    # One call is one Ctrl+Z, so exposing an input and taking another off is a
+    # single edit rather than two the user has to undo separately.
+    seen: list[dict[str, Any]] = []
+    promoting_call(monkeypatch, seen)
+    run(
+        S.promote_workspace_inputs(
+            promote={"98:12": ["steps", "image"]}, demote={"98:7": ["seed"]}
+        )
+    )
+    assert seen[0]["method"] == "promote"
+    assert seen[0]["params"] == {
+        "promote": {"98:12": ["steps", "image"]},
+        "demote": {"98:7": ["seed"]},
+    }
+
+
+def test_promoting_nothing_at_all_is_refused_before_the_round_trip():
+    with pytest.raises(ComfyError, match="promote, demote, or both"):
+        run(S.promote_workspace_inputs())
+
+
+def test_either_map_alone_is_enough(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    promoting_call(monkeypatch, seen)
+    run(S.promote_workspace_inputs(demote={"98:7": ["seed"]}))
+    assert seen[0]["params"] == {"promote": {}, "demote": {"98:7": ["seed"]}}
+
+
+def test_promotion_is_offered_with_the_other_workspace_tools():
+    assert "promote_workspace_inputs" in S.WORKSPACE_TOOLS
+    assert "pack_workspace_subgraph" in S.WORKSPACE_TOOLS
+
+
+def packing_call(monkeypatch: pytest.MonkeyPatch, seen: list[dict[str, Any]]) -> None:
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return json_response(200, {"client_id": "tab-1", "result": {"subgraph_node": "42"}})
+
+    as_workspace(monkeypatch, routed(**ALIVE, **ONE_TAB, call=capture))
+
+
+def test_packing_and_unpacking_ride_in_one_call(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    packing_call(monkeypatch, seen)
+    run(S.pack_workspace_subgraph(pack=["12", "13"], unpack=["105"]))
+    assert seen[0]["method"] == "pack"
+    assert seen[0]["params"] == {"pack": ["12", "13"], "unpack": ["105"]}
+
+
+def test_one_id_may_be_given_bare(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    packing_call(monkeypatch, seen)
+    run(S.pack_workspace_subgraph(unpack="105"))
+    assert seen[0]["params"] == {"pack": [], "unpack": ["105"]}
+
+
+def test_packing_nothing_is_refused_before_the_round_trip():
+    with pytest.raises(ComfyError, match="pack, unpack, or both"):
+        run(S.pack_workspace_subgraph())
+
+
+def test_an_ordinary_close_says_nothing_extra(monkeypatch):
+    seen: list[dict[str, Any]] = []
+    closing_call(monkeypatch, seen, result={"closed": "saved.json"})
+    assert "note" not in run(S.close_workspace_tab(tab="saved"))
 
 
 def test_diagnosis_defaults_to_the_whole_workflow(monkeypatch):
@@ -1152,6 +1273,21 @@ def test_a_workflow_file_is_loaded_as_api_format(monkeypatch, tmp_path):
     (workflows / "sampler.json").write_text(json.dumps({"1": {"class_type": "KSampler"}}), encoding="utf-8")
     run(S.load_workspace("sampler"))
     assert [c for c in seen if c["method"] == "load_graph"][0]["params"]["format"] == "api"
+
+
+def test_the_name_guard_travels_with_the_load(monkeypatch, tmp_path):
+    seen: list[dict[str, Any]] = []
+    _, workflows = loading(monkeypatch, tmp_path, seen)
+    (workflows / "sampler.json").write_text(
+        json.dumps({"1": {"class_type": "KSampler"}}), encoding="utf-8"
+    )
+
+    run(S.load_workspace("sampler"))
+    assert [c for c in seen if c["method"] == "load_graph"][0]["params"]["force"] is False
+
+    seen.clear()
+    run(S.load_workspace("sampler", force=True))
+    assert [c for c in seen if c["method"] == "load_graph"][0]["params"]["force"] is True
 
 
 def test_the_canvas_is_written_out_before_it_is_replaced(monkeypatch, tmp_path):

@@ -60,13 +60,50 @@ class ComfyProcess:
         return self._proc.pid if self.owned and self._proc else None
 
     def _launch_path(self) -> Path:
-        script = self.cfg.comfy_root / self.cfg.launch_script
+        root = self.cfg.comfy_root.resolve()
+        script = (self.cfg.comfy_root / self.cfg.launch_script).resolve()
+        if not script.is_relative_to(root):
+            raise ProcessError(
+                f"launch script {script} is outside {root}. COMFYUI_LAUNCH_SCRIPT names a "
+                "file inside the ComfyUI folder; point COMFYUI_ROOT at the install that "
+                "holds it rather than reaching out of it."
+            )
         if not script.exists():
             raise ProcessError(
                 f"launch script not found: {script}. "
                 "Set COMFYUI_ROOT / COMFYUI_LAUNCH_SCRIPT to point at your install."
             )
         return script
+
+    @staticmethod
+    def _command(script: Path) -> list[str]:
+        """How to start this script, which its extension decides.
+
+        `cmd.exe /c` runs a .bat and cannot run a .ps1: Windows ships no
+        association for .ps1 at all - `assoc .ps1` is empty on 11 - so cmd would
+        hand it to whatever the user has registered, or to nothing. PowerShell is
+        therefore invoked outright, with the flags install_node.bat already uses.
+
+        **`-ExecutionPolicy Bypass` applies to this one process** and alters
+        nothing on the machine. The alternative is telling somebody to loosen a
+        machine-wide policy to start ComfyUI, which is a far worse trade than
+        running the script they themselves chose in the settings window.
+
+        `powershell.exe` rather than `pwsh`: a launcher written for a portable
+        build is Windows PowerShell's, and pwsh need not be installed.
+        """
+        if script.suffix.lower() == ".ps1":
+            return [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ]
+        if sys.platform == "win32":
+            return ["cmd.exe", "/c", str(script)]
+        return [str(script)]
 
     async def start(self, client: ComfyClient, wait: bool = True) -> dict[str, object]:
         if await client.is_alive():
@@ -79,7 +116,7 @@ class ComfyProcess:
 
         log.info("launching %s", script)
         self._proc = subprocess.Popen(
-            ["cmd.exe", "/c", str(script)] if sys.platform == "win32" else [str(script)],
+            self._command(script),
             cwd=str(self.cfg.comfy_root),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

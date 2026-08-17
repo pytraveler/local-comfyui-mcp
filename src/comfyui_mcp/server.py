@@ -768,6 +768,9 @@ WORKSPACE_TOOLS = [
     "diagnose_workspace",
     "navigate_workspace",
     "switch_workspace_tab",
+    "close_workspace_tab",
+    "promote_workspace_inputs",
+    "pack_workspace_subgraph",
     "set_workspace_selection",
     "set_workspace_values",
     "set_workspace_node_modes",
@@ -1281,8 +1284,10 @@ async def _snapshot_canvas(client_id: str) -> Path | None:
 
 
 @tool("edit", "writes")
-async def load_workspace(name: str, backup: bool = True, client_id: str = "") -> dict[str, Any]:
-    """Open a saved workflow in the browser, replacing what is on the canvas.
+async def load_workspace(
+    name: str, backup: bool = True, force: bool = False, client_id: str = ""
+) -> dict[str, Any]:
+    """Open a saved workflow in the browser, as a tab in the ComfyUI window.
 
     The other half of save_workspace, and the way to put a workflow *file* under
     the workspace tools: load it, edit it with them, save it back. Without this
@@ -1293,16 +1298,33 @@ async def load_workspace(name: str, backup: bool = True, client_id: str = "") ->
     keeps the layout it was saved with; API format has none, so ComfyUI lays it
     out itself and the result is tidy rather than familiar.
 
+    **It opens a tab rather than replacing the one on screen.** ComfyUI reuses a
+    tab only when its own workflow store already knows the name, and that store
+    does not sync from this server's workflows directory - so a file usually
+    arrives in a new tab marked unsaved, with the workflow that was on screen
+    still open in its own. Loading that same file again reuses the tab it made
+    the first time, and that one is replaced. The reply reports the tabs and
+    whether one was added; switch_workspace_tab moves between them afterwards.
+
+    **A name ComfyUI already knows is refused.** It resolves the name against its
+    own saved workflows rather than against the directory the file came from, so
+    a file whose name matches one of the user's workflows would fill that
+    workflow's tab instead of opening one - leaving it looking edited, one Ctrl+S
+    from overwriting their work. Rename the file, or pass `force` when replacing
+    that workflow is the actual intent.
+
     **This is not undoable.** ComfyUI resets the undo history when a workflow is
     loaded, so Ctrl+Z will not bring the previous canvas back. That is what the
-    backup is for: the canvas being replaced is written to the export directory
-    first and the reply names the file.
+    backup is for, and it is the reused-tab case it covers: the canvas is written
+    to the export directory first and the reply names the file.
 
     Args:
         name: the file, with or without .json. Looked for in the workflows
             directory first, then the export directory; an absolute path also works.
         backup: write the current canvas to the export directory before replacing
             it. Leave it on unless the canvas is known to be worth nothing.
+        force: load even when ComfyUI already has a saved workflow of this name,
+            taking over its tab. Only when replacing that workflow is meant.
         client_id: which tab to load into; defaults to the most recently focused one.
     """
     graph, path, format = store.load_graph_file(CFG, name)
@@ -1311,7 +1333,7 @@ async def load_workspace(name: str, backup: bool = True, client_id: str = "") ->
 
     reply = await BRIDGE.call(
         "load_graph",
-        {"graph": graph, "format": format, "name": path.stem},
+        {"graph": graph, "format": format, "name": path.stem, "force": bool(force)},
         client_id=client_id,
     )
     result = reply.get("result") or {}
@@ -1323,6 +1345,13 @@ async def load_workspace(name: str, backup: bool = True, client_id: str = "") ->
     }
 
     notes = ["ComfyUI resets the undo history on a load, so Ctrl+Z will not undo this."]
+    tabs = result.get("workflow_tabs") or {}
+    if tabs.get("opened_new_tab"):
+        notes.append(
+            f"This opened a new workflow tab, and {tabs.get('count')} are now open - the "
+            "workflow that was on screen is still in its own. switch_workspace_tab lists "
+            "them and moves between them."
+        )
     if replaced is None and backup:
         notes.append("The canvas was empty, so there was nothing to back up.")
     if result.get("missing_node_types"):
@@ -1579,11 +1608,15 @@ async def switch_workspace_tab(
     being left behind are not lost - they belong to that workflow, which is why
     a tab can report `modified` while a different one is on screen.
 
+    "new" opens a blank workflow and switches to it, which is the same command
+    the + button on the tab bar runs. That is the way to start something from
+    nothing without disturbing what the user already has open.
+
     Args:
         to: which tab - an index from a previous call, its path or its filename,
-            or "next", "previous", or "recent" for the one active before this.
-            Empty reports without moving. A name matching two open tabs is
-            refused rather than guessed.
+            or "next", "previous", "recent" for the one active before this, or
+            "new" for a fresh blank workflow. Empty reports without moving. A
+            name matching two open tabs is refused rather than guessed.
         force: reload the tab already on screen instead of reporting that it is
             already there.
         client_id: which browser tab to ask; defaults to the most recently focused.
@@ -1591,6 +1624,147 @@ async def switch_workspace_tab(
     reply = await BRIDGE.call(
         "tabs", {"to": str(to), "force": bool(force)}, client_id=client_id
     )
+    result = reply.get("result") or {}
+    return {"client_id": reply.get("client_id"), **result}
+
+
+@tool("edit", "writes")
+async def close_workspace_tab(
+    tab: str = "", force: bool = False, client_id: str = ""
+) -> dict[str, Any]:
+    """Close one of the workflow tabs open in the ComfyUI window.
+
+    The counterpart to switch_workspace_tab, and the way to tidy up after a run
+    of loads - each one opens its own tab, and they stay until something closes
+    them.
+
+    **Nothing here is written to disk and nothing can be undone.** A closed
+    workflow is out of the tab bar; if it had unsaved changes, they are gone. So
+    a tab with unsaved changes is refused unless `force` says otherwise, and only
+    ComfyUI's own Save in the browser clears that flag - save_workspace writes a
+    copy to disk and leaves the workflow just as modified.
+
+    Closing the tab on screen moves to a neighbour first, so the canvas never
+    ends up showing a workflow that is no longer open. The last remaining tab is
+    refused: closing it would leave the window with nothing.
+
+    Args:
+        tab: which one - an index from switch_workspace_tab, its path, or its
+            filename. Empty closes the tab currently on screen. A name matching
+            two open tabs is refused rather than guessed.
+        force: close even when the tab has unsaved changes, losing them.
+        client_id: which browser tab to ask; defaults to the most recently focused.
+    """
+    reply = await BRIDGE.call(
+        "close_tab", {"tab": str(tab), "force": bool(force)}, client_id=client_id
+    )
+    result = reply.get("result") or {}
+    closed: dict[str, Any] = {"client_id": reply.get("client_id"), **result}
+    if result.get("discarded_unsaved_changes"):
+        closed["note"] = (
+            f"{result.get('closed')} had unsaved changes and force was given, so they are "
+            "gone - ComfyUI keeps no history of a closed workflow."
+        )
+    return closed
+
+
+@tool("edit", "edits")
+async def promote_workspace_inputs(
+    promote: dict[str, Any] | None = None,
+    demote: dict[str, Any] | None = None,
+    client_id: str = "",
+) -> dict[str, Any]:
+    """Expose an inner node's inputs on the face of the subgraph that holds it.
+
+    A subgraph with nothing promoted is a sealed box: the values that drive it
+    can only be reached by going inside, and nothing outside can be wired to it.
+    This is what ComfyUI offers as "Promote widget" on a widget's context menu,
+    and it is the difference between a subgraph that is usable from the outside
+    and one that merely hides its contents.
+
+    Both kinds of input take the same path. A widget row (`steps`, `cfg`) becomes
+    a widget on the subgraph node's face; a plain socket (`image`, `model`)
+    becomes a socket that can be wired to. Name them the same way either way.
+
+    **The id names both ends.** `98:12` is node 12 inside subgraph node 98, and
+    the input is exposed on 98. There is no separate "which subgraph" argument
+    and no need to navigate inside first. To carry something further out, ask
+    again with the shorter id - each level is its own step, and its own entry in
+    the reply.
+
+    One call is one Ctrl+Z. Nothing is written unless every named input resolves,
+    so a typo refuses the batch rather than half-applying it.
+
+    Args:
+        promote: which inputs to expose, as {"<subgraph node>:<node>": [names]}.
+            An input already exposed is reported in `skipped`, not an error. An
+            input already wired to something inside the subgraph is refused,
+            since promoting it would replace that link.
+        demote: which to take off again, same shape. A boundary slot with
+            something wired into it from outside is disconnected rather than
+            removed, so the outer link survives.
+        client_id: which browser tab to act in; defaults to the most recently
+            focused one.
+    """
+    payload = {"promote": promote or {}, "demote": demote or {}}
+    if not payload["promote"] and not payload["demote"]:
+        raise ComfyError("give promote, demote, or both")
+
+    reply = await BRIDGE.call("promote", payload, client_id=client_id)
+    result = reply.get("result") or {}
+    return {"client_id": reply.get("client_id"), **result}
+
+
+@tool("edit", "edits")
+async def pack_workspace_subgraph(
+    pack: list[str] | str | None = None,
+    unpack: list[str] | str | None = None,
+    client_id: str = "",
+) -> dict[str, Any]:
+    """Wrap nodes and groups into a new subgraph, or dissolve one back out.
+
+    ComfyUI's "Convert to Subgraph" and its Unpack counterpart. Folding a stage
+    into a subgraph is how a workflow stops being a wall of nodes: the box keeps
+    its own wiring, and promote_workspace_inputs decides which of its values show
+    on the outside.
+
+    It acts on **the graph on screen**, so packing while inside a subgraph nests
+    one. Ids are the plain local ones a read of that graph reports, not the
+    `98:12` path form - a selection only ever belongs to one graph. Use
+    navigate_workspace first when the nodes are a level down.
+
+    A group can be named instead of listing its nodes: it goes in along with
+    everything inside it, which is what selecting one on the canvas amounts to.
+
+    One call is one Ctrl+Z, and unpacking happens before packing - so a single
+    call can dissolve a subgraph and re-wrap its parts differently.
+
+    **Ids do not survive either direction.** Packing replaces the nodes with one
+    new node; unpacking hands the contents fresh ids rather than the ones they
+    went in with - measured, 144 and 145 came back out as 158 and 159. Read the
+    graph again afterwards rather than reusing ids from before.
+
+    This is not the same as moving a node into a subgraph that already exists.
+    ComfyUI has no operation for that; unpack the subgraph, then pack the parts
+    together with whatever else belongs there.
+
+    Args:
+        pack: node and group ids to fold into one new subgraph. Anything that is
+            not one convertible block is refused by litegraph, which says
+            nothing else, so the refusal names that.
+        unpack: subgraph node ids to dissolve, putting their contents back into
+            the graph on screen. A node that is not a subgraph is refused.
+        client_id: which browser tab to act in; defaults to the most recently
+            focused one.
+    """
+    def as_list(value: list[str] | str | None) -> list[str]:
+        return [value] if isinstance(value, str) else [str(v) for v in (value or [])]
+
+    payload = {"pack": as_list(pack), "unpack": as_list(unpack)}
+    if not payload["pack"] and not payload["unpack"]:
+        raise ComfyError("give pack, unpack, or both")
+
+    reply = await BRIDGE.call("pack", payload, client_id=client_id)
     result = reply.get("result") or {}
     return {"client_id": reply.get("client_id"), **result}
 

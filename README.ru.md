@@ -6,7 +6,7 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
-![Tools](https://img.shields.io/badge/tools-45-green)
+![Tools](https://img.shields.io/badge/tools-48-green)
 
 ---
 
@@ -104,7 +104,7 @@ Junction (симлинк на Unix) в `custom_nodes`, так что второ�
 при старте. Дальше достаточно открыть вкладку; `workspace_status` скажет, обе ли
 половины на месте.
 
-## Что умеют 45 инструментов
+## Что умеют 48 инструментов
 
 | Группа | Для чего |
 |---|---|

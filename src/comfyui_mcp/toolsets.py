@@ -10,7 +10,7 @@ then lies about itself.
 
 Three reasons this exists, and only the last is about safety:
 
-*Context.* All 45 schemas reach the model at the start of every session. Somebody
+*Context.* All 48 schemas reach the model at the start of every session. Somebody
 who only ever runs workflow files pays for twenty canvas tools they never call.
 
 *The decision is made when nobody is in a hurry.* A permission prompt raised in

@@ -6,7 +6,7 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
-![Tools](https://img.shields.io/badge/tools-45-green)
+![Tools](https://img.shields.io/badge/tools-48-green)
 
 ---
 
@@ -103,7 +103,7 @@ copy to drift. No administrator rights needed.
 that, opening a tab is all it takes; `workspace_status` says whether both halves
 are in place.
 
-## What the 45 tools cover
+## What the 48 tools cover
 
 | Group | What it is for |
 |---|---|

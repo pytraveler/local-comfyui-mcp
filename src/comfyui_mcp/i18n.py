@@ -2,7 +2,7 @@
 
 The split is along who the text is for, not along which module it lives in:
 
-*The model reads English, always.* All 45 tool docstrings, every `hint` in a tool
+*The model reads English, always.* All 48 tool docstrings, every `hint` in a tool
 result and the MCP server instructions are English and are not touched by anything
 here. They are part of an interface to a program, and a program that is told about
 its tools in one language and answers questions about them in another is being made

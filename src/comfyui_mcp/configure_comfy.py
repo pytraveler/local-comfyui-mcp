@@ -74,8 +74,8 @@ FIELDS: tuple[Field, ...] = (
         Text(en="What starts it", ru="Чем запускать"),
         "script",
         Text(
-            en="The .bat the comfy_start tool runs. The list is what was found in the folder above.",
-            ru="Этот .bat запускает инструмент comfy_start. Список - то, что нашлось в папке выше.",
+            en="The script the comfy_start tool runs: .bat, .cmd, .ps1 or .sh. The list is what was found in the folder above.",
+            ru="Скрипт, который запускает comfy_start: .bat, .cmd, .ps1 или .sh. Список - то, что нашлось в папке выше.",
         ),
     ),
     Field(
@@ -173,6 +173,19 @@ class Problem:
     message: Text
 
 
+def _inside(root: str, script: str) -> bool:
+    """Whether `script`, joined onto `root`, still lands inside it.
+
+    Total on purpose: a value this cannot resolve - a drive that is not mounted,
+    a name the OS rejects - is not evidence of an escape, and the window must not
+    refuse to describe a setting it merely could not check.
+    """
+    try:
+        return (Path(root) / script).resolve().is_relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return True
+
+
 def check(values: dict[str, str]) -> list[Problem]:
     """Everything worth saying about a set of values, worst first.
 
@@ -230,6 +243,18 @@ def check(values: dict[str, str]) -> list[Problem]:
             )
         )
 
+    if root and script and not _inside(root, script):
+        out.append(
+            Problem(
+                "COMFYUI_LAUNCH_SCRIPT",
+                "error",
+                Text(
+                    en="that path leads outside the folder above - name a file inside it",
+                    ru="этот путь ведёт за пределы указанной выше папки - назовите файл внутри неё",
+                ),
+            )
+        )
+
     port = values.get("COMFYUI_PORT", "").strip()
     if port:
         if not port.isdigit() or not (1 <= int(port) <= 65535):
@@ -261,12 +286,30 @@ def check(values: dict[str, str]) -> list[Problem]:
     return sorted(out, key=lambda p: p.severity != "error")
 
 
+LAUNCH_SUFFIXES = (".bat", ".cmd", ".ps1", ".sh")
+
+
 def launch_scripts(root: str) -> list[str]:
-    """The .bat files sitting in the portable root, most likely first."""
+    """The launch scripts sitting in the portable root, most likely first.
+
+    `.ps1` belongs on this list and leaving it off was theatre rather than
+    safety: the setting already runs a script of the user's choosing, and a
+    `.bat` can do everything a `.ps1` can, starting with calling PowerShell. What
+    a `.bat` could not do was carry the multi-GPU flags somebody had already
+    written in a `.ps1` - so the filter cost real setups and bought nothing.
+
+    Not gated on the platform, because the folder already is: a portable Windows
+    build has no `.sh` in it and a Linux install has no `.bat`. Listing what is
+    actually there is the whole point of the field.
+    """
     folder = Path(root)
     if not root or not folder.is_dir():
         return []
-    found = sorted(entry.name for entry in folder.glob("*.bat") if entry.is_file())
+    found = sorted(
+        entry.name
+        for entry in folder.iterdir()
+        if entry.is_file() and entry.suffix.lower() in LAUNCH_SUFFIXES
+    )
     return sorted(found, key=lambda name: (0 if "nvidia" in name.lower() else 1, name))
 
 

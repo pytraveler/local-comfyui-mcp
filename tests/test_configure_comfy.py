@@ -118,6 +118,36 @@ def test_a_root_that_is_not_a_folder_offers_nothing():
     assert CC.launch_scripts("Z:\\nowhere") == []
 
 
+def test_a_powershell_launcher_is_offered_too(tmp_path: Path):
+    """Refusing .ps1 cost real setups and bought nothing.
+
+    This setting already runs a script of the user's choosing, and a .bat can do
+    everything a .ps1 can - so the filter was not a boundary, while the multi-GPU
+    flags people keep in a .ps1 were unreachable because of it.
+    """
+    root = portable(tmp_path, script="")
+    for name in ("run_nvidia_gpu.bat", "run_multigpu.ps1", "start.cmd", "notes.md"):
+        (root / name).write_text("", encoding="utf-8")
+    assert CC.launch_scripts(str(root)) == ["run_nvidia_gpu.bat", "run_multigpu.ps1", "start.cmd"]
+
+
+def test_a_launch_script_reaching_out_of_the_root_is_an_error(tmp_path: Path):
+    root = portable(tmp_path, script="run_nvidia_gpu.bat")
+    values = CC.read_env(root / ".env") if (root / ".env").is_file() else {}
+    values = {**values, "COMFYUI_ROOT": str(root)}
+
+    for escape in (str(tmp_path / "elsewhere.bat"), "..\\elsewhere.bat"):
+        problems = CC.check({**values, "COMFYUI_LAUNCH_SCRIPT": escape})
+        escaped = [p for p in problems if p.key == "COMFYUI_LAUNCH_SCRIPT" and p.severity == "error"]
+        assert escaped, escape
+
+
+def test_a_plain_name_inside_the_root_is_not_flagged(tmp_path: Path):
+    root = portable(tmp_path, script="run_nvidia_gpu.bat")
+    problems = CC.check({"COMFYUI_ROOT": str(root), "COMFYUI_LAUNCH_SCRIPT": "run_nvidia_gpu.bat"})
+    assert [p for p in problems if p.key == "COMFYUI_LAUNCH_SCRIPT"] == []
+
+
 def where(*parts: str) -> str:
     return str(Path(Path.cwd().anchor, *parts))
 

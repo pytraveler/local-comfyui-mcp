@@ -151,6 +151,19 @@ that, set `COMFYUI_BRIDGE_TOKEN` here and `COMFYUI_MCP_BRIDGE_TOKEN` in
 ComfyUI's own environment - the bridge adds routes to ComfyUI's server, and one
 of them restarts the process.
 
+**A ComfyUI behind a reverse proxy is the other half of that.** `COMFYUI_USER`
+and `COMFYUI_PASSWORD` send Basic Auth on both the HTTP calls and the WebSocket,
+which is what a proxy asking for credentials in front of the whole API needs -
+where the bridge token guards only the bridge's own routes. Set both or neither:
+one alone authenticates with nothing, and `comfy_status` says so rather than
+leaving you with a bare 401. The password goes in `.env`, not into the URL, where
+it would show up in process lists, logs and error text.
+
+**After editing `.env`, restart the server process.** Reconnecting from the MCP
+client makes a new session against the same process, and the configuration was
+read once when that process started - so a reconnect leaves the old values in
+place with nothing saying so.
+
 **The tool switch is not a security boundary**, and the tool descriptions say so.
 `configure.bat` decides what is offered, which is a coarse grid: the question
 about `download_model` is not whether it exists but where it may point, and that

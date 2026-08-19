@@ -28,8 +28,8 @@ from . import logs as L
 from . import store
 from . import toolsets as T
 from .bridge import BridgeClient, WorkspaceError, WorkspaceUnavailable
-from .client import ComfyClient, ComfyError, MediaRef, RunEvent, collect_media
-from .config import Config, load_config
+from .client import ComfyClient, ComfyError, MediaRef, RunEvent, basic_auth, collect_media
+from .config import Config, auth_problem, load_config
 from .process import ComfyProcess, ProcessError, open_in_browser
 
 log = logging.getLogger("comfyui_mcp")
@@ -522,6 +522,11 @@ async def comfy_status() -> dict[str, Any]:
         "env_file": str(CFG.env_file) if CFG.env_file else None,
         "started_by_mcp": PROCESS.owned,
     }
+    if basic_auth(CFG) is not None:
+        info["auth"] = "basic"
+    half = auth_problem(CFG)
+    if half:
+        info["config_warning"] = half
     if not CFG.comfy_root.is_dir():
         info["config_warning"] = (
             f"COMFYUI_ROOT does not exist: {CFG.comfy_root}. "
@@ -543,7 +548,14 @@ async def comfy_status() -> dict[str, Any]:
         if stray:
             info["tools"]["unknown_in_spec"] = stray
     if not alive:
-        info["hint"] = "call comfy_start to launch it"
+        why = await CLIENT.why_unreachable()
+        if why:
+            info["why"] = why
+        info["hint"] = (
+            "check the credentials rather than starting it"
+            if why
+            else "call comfy_start to launch it"
+        )
         return info
 
     stats = await CLIENT.system_stats()

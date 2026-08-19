@@ -50,6 +50,11 @@ class Config:
     # workspace bridge
     bridge_token: str
 
+    # Basic Auth, for a ComfyUI behind a reverse proxy. Empty means no auth, which
+    # is the localhost case and stays byte-for-byte what it was.
+    http_user: str
+    http_password: str
+
     # which tools are offered
     tools: str
 
@@ -114,6 +119,22 @@ class Config:
 
 class ConfigError(ValueError):
     """A COMFYUI_* variable is present but unusable."""
+
+
+def auth_problem(cfg: Config) -> str:
+    """The half-filled credential pair, named. Empty when there is nothing to say.
+
+    Both or neither: one alone sends no `Authorization` header at all, so the
+    symptom is a bare 401 that says nothing about the setting somebody was part
+    way through writing. Pure and reported rather than raised - `is_alive` has to
+    stay total, and a config that cannot reach ComfyUI is still a config worth
+    describing.
+    """
+    if cfg.http_user and not cfg.http_password:
+        return "COMFYUI_USER is set but COMFYUI_PASSWORD is empty, so no credentials are sent"
+    if cfg.http_password and not cfg.http_user:
+        return "COMFYUI_PASSWORD is set but COMFYUI_USER is empty, so no credentials are sent"
+    return ""
 
 
 def _str(name: str, default: str) -> str:
@@ -238,6 +259,8 @@ def load_config() -> Config:
         bridge_timeout=_float("COMFYUI_BRIDGE_TIMEOUT", 20),
         download_timeout=_float("COMFYUI_DOWNLOAD_TIMEOUT", 60),
         bridge_token=_str("COMFYUI_BRIDGE_TOKEN", ""),
+        http_user=_str("COMFYUI_USER", ""),
+        http_password=_str("COMFYUI_PASSWORD", ""),
         tools=_str("COMFYUI_TOOLS", "all"),
         lang=_str("COMFYUI_LANG", ""),
         download_token=_str("COMFYUI_DOWNLOAD_TOKEN", ""),

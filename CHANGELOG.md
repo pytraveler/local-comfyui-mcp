@@ -8,6 +8,38 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
+## 0.1.4 - 2026-08-19
+
+### Added
+
+- **`COMFYUI_USER` and `COMFYUI_PASSWORD`: Basic Auth for a ComfyUI reached
+  through a reverse proxy.** The bridge token guards the bridge's own routes; a
+  proxy asks for credentials in front of the whole API, so the two compose rather
+  than overlap. The pair is sent on the HTTP calls and on the WebSocket from one
+  source - two sources drift, and that failure reads as a broken WebSocket rather
+  than a credential problem. The password goes in `.env` rather than into the URL,
+  where it would surface in process lists, logs and error text.
+
+  **Empty changes nothing.** Both halves or neither: with none set the client is
+  built exactly as it always was, which is the case everybody on localhost is in.
+  Half a pair authenticates with nothing, so that is named outright instead of
+  being left to a 401 that says nothing about the setting somebody was part way
+  through filling in.
+
+### Changed
+
+- **`comfy_status` says why it could not reach ComfyUI.** A proxy answering 401
+  looked exactly like a ComfyUI that was not running, which sends somebody off to
+  start one that is already up, or to open a firewall that was never shut. Three
+  cases are now told apart: nothing configured and something is asking,
+  credentials sent and rejected, and any other non-200. It also reports
+  `auth: "basic"` when it is on - never the credentials themselves.
+
+- **`websockets` now needs 14.0 or newer.** The header parameter was renamed
+  `additional_headers` in 14, and the old `extra_headers` is gone rather than
+  deprecated: passing it raises `TypeError`, which would have been swallowed into
+  a silent fall back to polling. Nothing else about the dependency changed.
+
 ## 0.1.3 - 2026-08-17
 
 ### Added

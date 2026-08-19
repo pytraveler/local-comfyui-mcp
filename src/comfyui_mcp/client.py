@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import uuid
@@ -15,6 +16,30 @@ import httpx
 from .config import Config
 
 log = logging.getLogger(__name__)
+
+
+def basic_auth(cfg: Config) -> httpx.BasicAuth | None:
+    """Credentials for a ComfyUI behind a reverse proxy, or None for localhost.
+
+    Both halves or nothing at all: a half-filled pair authenticates with neither,
+    and `config.auth_problem` is what says so out loud.
+    """
+    if cfg.http_user and cfg.http_password:
+        return httpx.BasicAuth(cfg.http_user, cfg.http_password)
+    return None
+
+
+def auth_headers(cfg: Config) -> dict[str, str]:
+    """The same credentials as a header, for the WebSocket.
+
+    httpx builds this itself from `BasicAuth`; websockets does not, so it is built
+    here - and from the same pair, because two sources drift and the failure is a
+    socket that 401s while every HTTP call succeeds.
+    """
+    if not (cfg.http_user and cfg.http_password):
+        return {}
+    raw = f"{cfg.http_user}:{cfg.http_password}".encode()
+    return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
 
 
 @dataclass(frozen=True)
@@ -74,7 +99,11 @@ class ComfyClient:
 
     async def http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(base_url=self.cfg.base_url, timeout=self.cfg.request_timeout)
+            self._http = httpx.AsyncClient(
+                base_url=self.cfg.base_url,
+                timeout=self.cfg.request_timeout,
+                auth=basic_auth(self.cfg),
+            )
         return self._http
 
     async def aclose(self) -> None:
@@ -89,6 +118,36 @@ class ComfyClient:
             return resp.status_code == 200
         except (httpx.HTTPError, OSError):
             return False
+
+    async def why_unreachable(self) -> str:
+        """Why ComfyUI did not answer, when the answer is worth a sentence.
+
+        A proxy that rejects the credentials replies 401, and `is_alive` reports
+        that as "not running" - which sends somebody off to start a ComfyUI that
+        is already up, or to open a firewall that was never shut. One extra
+        request tells the two apart. Empty when there is nothing to add.
+
+        Total, like `is_alive`: this is called to explain a failure and must not
+        become one.
+        """
+        try:
+            client = await self.http()
+            resp = await client.get("/system_stats", timeout=3.0)
+        except (httpx.HTTPError, OSError):
+            return ""
+        if resp.status_code in (401, 407):
+            if basic_auth(self.cfg) is None:
+                return (
+                    f"ComfyUI answered {resp.status_code}: something in front of it is asking "
+                    "for credentials. Set COMFYUI_USER and COMFYUI_PASSWORD."
+                )
+            return (
+                f"ComfyUI answered {resp.status_code}: COMFYUI_USER and COMFYUI_PASSWORD were "
+                "sent and rejected."
+            )
+        if resp.status_code != 200:
+            return f"ComfyUI answered {resp.status_code} rather than 200."
+        return ""
 
     async def system_stats(self) -> dict[str, Any]:
         client = await self.http()
@@ -272,8 +331,12 @@ class ComfyClient:
         url = f"{self.cfg.ws_url}?clientId={self.client_id}"
         prompt_id = ""
         try:
+            headers = auth_headers(self.cfg)
             async with websockets.connect(
-                url, max_size=None, ping_interval=self.cfg.ws_ping_interval
+                url,
+                max_size=None,
+                ping_interval=self.cfg.ws_ping_interval,
+                **({"additional_headers": headers} if headers else {}),
             ) as ws:
                 prompt_id = await self._submit(graph, on_submitted, on_node_errors, submit_with)
                 history = await self._wait_on_ws(ws, prompt_id, timeout, on_progress)

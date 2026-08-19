@@ -17,6 +17,18 @@ class WorkflowError(ValueError):
 GUIDE_SUFFIX = ".md"
 
 
+def _as_json_path(path: Path) -> Path:
+    """Give a path a .json extension, appending it rather than replacing one.
+
+    `with_suffix` reads `bench_0.8mp_15s` as a stem plus a `.8mp_15s` extension and
+    overwrites that, silently truncating the name at its first dot. Versions and
+    resolutions are written with dots all the time, so the name has to be appended to.
+    """
+    if path.suffix.lower() == ".json":
+        return path
+    return path.with_name(path.name + ".json")
+
+
 def _is_api_format(data: Any) -> bool:
     return isinstance(data, dict) and any(
         isinstance(node, dict) and "class_type" in node for node in data.values()
@@ -60,8 +72,7 @@ def resolve_path(cfg: Config, name: str) -> Path:
         path = candidate
     else:
         path = cfg.workflows_dir / name
-        if path.suffix.lower() != ".json":
-            path = path.with_suffix(".json")
+        path = _as_json_path(path)
         root = cfg.workflows_dir.resolve()
         if not str(path.resolve()).startswith(str(root)):
             raise WorkflowError(f"workflow name escapes the workflows directory: {name}")
@@ -114,8 +125,7 @@ def load_guide(cfg: Config, name: str) -> tuple[str, Path]:
 
 def _write_json(root: Path, name: str, data: Any, overwrite: bool, what: str) -> Path:
     path = root / name
-    if path.suffix.lower() != ".json":
-        path = path.with_suffix(".json")
+    path = _as_json_path(path)
     if not str(path.resolve()).startswith(str(root.resolve())):
         raise WorkflowError(f"{what} name escapes {root}: {name}")
     if path.exists() and not overwrite:
@@ -165,8 +175,7 @@ def resolve_graph_file(cfg: Config, name: str) -> Path:
 
     for root in (cfg.workflows_dir, cfg.export_dir):
         path = root / name
-        if path.suffix.lower() != ".json":
-            path = path.with_suffix(".json")
+        path = _as_json_path(path)
         if not str(path.resolve()).startswith(str(root.resolve())):
             raise WorkflowError(f"name escapes {root}: {name}")
         if path.is_file():

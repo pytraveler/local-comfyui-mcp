@@ -123,6 +123,34 @@ def test_an_export_gets_a_json_extension_if_it_was_not_given_one(cfg):
     assert store.save_export(cfg, "canvas", UI_GRAPH).name == "canvas.json"
 
 
+def test_a_dotted_name_keeps_everything_after_its_first_dot(cfg):
+    assert (
+        store.save_export(cfg, "bench_0.8mp_15s", UI_GRAPH).name
+        == "bench_0.8mp_15s.json"
+    )
+
+
+def test_a_dotted_name_round_trips_through_resolution(cfg):
+    saved = store.save_workflow(cfg, "bench_0.8mp_15s", MINIMAL)
+    assert saved.name == "bench_0.8mp_15s.json"
+    assert store.resolve_path(cfg, "bench_0.8mp_15s") == saved
+    assert store.resolve_path(cfg, "bench_0.8mp_15s.json") == saved
+    assert [w["name"] for w in store.list_workflows(cfg)] == ["bench_0.8mp_15s"]
+
+
+def test_a_dotted_export_is_found_by_name(cfg):
+    saved = store.save_export(cfg, "canvas_v1.2", UI_GRAPH)
+    assert store.resolve_graph_file(cfg, "canvas_v1.2") == saved
+
+
+def test_a_dotted_workflow_finds_its_guide(cfg):
+    store.save_workflow(cfg, "bench_0.8mp_15s", MINIMAL)
+    (cfg.workflows_dir / "bench_0.8mp_15s.md").write_text("how to fill it in", encoding="utf-8")
+    text, path = store.load_guide(cfg, "bench_0.8mp_15s")
+    assert text == "how to fill it in"
+    assert path.name == "bench_0.8mp_15s.md"
+
+
 def test_an_export_does_not_replace_a_file_by_accident(cfg):
     store.save_export(cfg, "canvas", UI_GRAPH)
     with pytest.raises(store.WorkflowError, match="already exists"):

@@ -8,6 +8,22 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
+## 0.1.5 - unreleased
+
+### Fixed
+
+- **A name containing a dot no longer loses everything after it.** Saving
+  `bench_0.8mp_15s` wrote `bench_0.json`. `Path.with_suffix` reads `.8mp_15s` as
+  the extension and *replaces* it instead of appending, and a name carrying a
+  resolution or a version number is written with dots all the time. Nothing
+  reported it: the call succeeded and answered with the truncated path, so the
+  file was merely somewhere other than the name asked for - and a second save
+  under a neighbouring name would have silently overwritten it. The three places
+  that turn a name into a `.json` file - `resolve_path`, `_write_json` behind
+  both `save_workflow` and `save_export`, and `resolve_graph_file` - now share
+  one helper that appends. A name already ending in `.json` is untouched, as
+  before, and the sidecar guide still resolves beside it.
+
 ## 0.1.4 - 2026-08-19
 
 ### Added

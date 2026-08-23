@@ -8,7 +8,61 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
-## 0.1.5 - unreleased
+## 0.1.6 - 2026-08-23
+
+### Fixed
+
+- **A ComfyUI orphaned by a hard kill of this server can be stopped again.**
+  Stopping on a graceful exit covers the tidy case; a killed server still leaves
+  ComfyUI running, and until now that orphan was also unreachable, because
+  ownership lived only in memory - `comfy_stop` refused the very process it had
+  started, while the port stayed taken and the model stayed resident. The pid is
+  now recorded when ComfyUI is launched, and a starting server takes it back.
+
+  **It adopts; it does not reap.** Killing whatever the record names at startup is
+  the obvious shortcut and is wrong twice: a generation outlives an editor crash
+  and can still be running - twenty minutes and more is ordinary here - and two MCP
+  clients open at once would each shoot down the other's ComfyUI on launch. So
+  ownership is restored and the decision is left to whoever is sitting there.
+
+  **A pid alone is a number, so the start time is recorded with it.** Pids are
+  reused, readily on Windows and on every platform after a reboot, so a record that
+  only named a pid could later name somebody's editor. Adoption requires the start
+  time to match too, and a record that fails to verify is deleted rather than kept.
+  Where that stamp cannot be read the record is not written at all, since acting on
+  it later could not be made safe. The check also has to mean *running* rather than
+  *findable*: a process object outlives the process while any handle to it survives,
+  so reading a start time succeeds for one that has already exited - which showed up
+  live as `comfy_status` reporting a ComfyUI of ours that was long gone. Note that `tempfile`'s auto-deleting kinds are
+  unusable for this: such a file is removed when the process is killed, which is
+  precisely the case it would exist to survive.
+
+- **A ComfyUI this server started is no longer left running when the server
+  exits, and stopping it now reaches ComfyUI itself.** Two faults met here. The
+  process held is the `cmd.exe` or shell the launch script runs in, and python is
+  its *child*, so the POSIX path - a bare `terminate()` on that shim - killed the
+  wrapper and left python holding the port and the GPU; only the Windows path
+  walked the tree. And nothing stopped anything on the way out: `main`'s `finally`
+  closed the HTTP client and never touched the process, so even a clean shutdown
+  orphaned it. `stop` now signals the whole tree on both platforms - a process
+  group on POSIX, `taskkill /T` on Windows - and a graceful exit stops it.
+
+  **Asked before it is forced.** The old path went straight to a hard kill, which
+  costs ComfyUI the chance to finish what it had open. It escalates immediately
+  rather than waiting out the grace period when the ask cannot be delivered, which
+  on Windows is the ordinary case: taskkill's polite form talks to windows, and a
+  ComfyUI started with `CREATE_NO_WINDOW` has none to talk to.
+
+  **A ComfyUI you started yourself is still never touched.** That gate is
+  ownership, not whether something answers the port - a hand-started instance
+  answers it too. For the same reason the pid is deliberately *not* written to
+  disk to survive a server restart: pids are reused, and adopting one by number
+  risks signalling a process that is not ours. A hard kill of the server therefore
+  still leaves ComfyUI running, which is the safe direction to fail in - tying its
+  lifetime to this process would take a running generation down with an IDE
+  restart.
+
+## 0.1.5 - 2026-08-19
 
 ### Fixed
 

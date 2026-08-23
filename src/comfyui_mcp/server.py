@@ -593,9 +593,14 @@ async def comfy_start(wait: bool = True) -> dict[str, Any]:
 
 @tool("process", "process")
 async def comfy_stop() -> dict[str, Any]:
-    """Stop the ComfyUI process that this server started.
+    """Stop the ComfyUI process that this server started, and everything under it.
 
-    A ComfyUI you launched yourself is not touched.
+    A ComfyUI you launched yourself is not touched - ownership is the test, not
+    whether something is answering the port.
+
+    This reaches a ComfyUI started before the server was last restarted as well:
+    ownership is recorded on disk and taken back at startup, so an instance
+    orphaned by a crash is still stoppable here.
     """
     return await PROCESS.stop()
 
@@ -3305,6 +3310,28 @@ async def upload_input_image(path: str, subfolder: str = "") -> dict[str, Any]:
     return {"uploaded": True, "load_image_name": name, "raw": result}
 
 
+async def _shutdown() -> None:
+    """Give back what this server took.
+
+    A ComfyUI this server started has nothing driving it once this process is gone,
+    so it is stopped rather than left holding the port and the GPU. One the user
+    started is not ours to touch, and `PROCESS.stop()` is where that is decided -
+    it refuses anything it has no `_proc` for, so the rule lives in one place
+    instead of being restated here.
+
+    Only a graceful exit reaches this. A hard kill still orphans ComfyUI, and
+    closing that gap would mean tying its lifetime to this process - which would
+    take a running generation down with an IDE restart, a worse trade than the
+    orphan. Failing to stop it must not stop the client being closed, hence the
+    catch: a shutdown that raises here would leak the HTTP connections too.
+    """
+    try:
+        await PROCESS.stop()
+    except Exception:  # noqa: BLE001 - a launcher can fail in any way on the way out
+        log.warning("could not stop the ComfyUI this server started", exc_info=True)
+    await CLIENT.aclose()
+
+
 def main() -> None:
     if "--list-tools" in sys.argv:
         payload = T.catalogue(lang=LANG)
@@ -3324,11 +3351,19 @@ def main() -> None:
         log.warning("COMFYUI_TOOLS names %r, which is neither a group nor a tool", stray)
     for note in T.warnings(lang=LANG):
         log.warning("%s", note)
+
+    # A hard kill of a previous run leaves ComfyUI going with nothing driving it.
+    # Taking it back is what makes it stoppable again; it is deliberately not
+    # stopped here - see ComfyProcess.adopt.
+    adopted = PROCESS.adopt()
+    if adopted.get("adopted"):
+        log.info("took back the ComfyUI started earlier (pid %s)", adopted.get("pid"))
+
     try:
         mcp.run()
     finally:
         try:
-            asyncio.run(CLIENT.aclose())
+            asyncio.run(_shutdown())
         except RuntimeError:
             pass
 

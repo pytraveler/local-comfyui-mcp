@@ -116,6 +116,13 @@ are in place.
 | **Downloading models** | fetch a model to the directory ComfyUI actually reads, with progress |
 | **Process and tab** | start, stop or restart ComfyUI; reload the browser tab |
 
+A ComfyUI **this server started** is stopped when the server exits, and stopping
+it takes the whole tree rather than the launcher it runs behind. A ComfyUI **you
+started yourself** is never touched by any of this. If the server is killed
+outright its ComfyUI keeps running - the next server recognises it and can stop
+it, but does not do so on its own, because a generation outlives an editor crash
+and may still be running.
+
 Not all of them have to be offered. `configure.bat` writes one line to `.env` that
 narrows the set - a switched-off tool is not registered at all, so its schema
 never reaches the model's context. What is off is reported by `comfy_status`, so

@@ -220,3 +220,97 @@ def test_a_node_with_no_size_yet_still_occupies_a_row() -> None:
 
 def test_an_empty_graph_answers_rather_than_throwing() -> None:
     assert arrange([])["positions"] == {}
+
+
+def test_a_source_sits_beside_what_reads_it_not_at_the_far_left() -> None:
+    """The rule that decides a column is "just left of my consumer", not "right of my source".
+
+    `loader` feeds only `sink`, which is three columns along. Placing it one past its
+    own sources would put it in the first column with every other loader and stretch
+    the link across the whole graph - measured on a real 133-node workflow, that rule
+    put 71 of them in column 0.
+    """
+    nodes = [
+        node("a"),
+        node("b", feeds_from=["a"]),
+        node("sink", feeds_from=["b", "loader"]),
+        node("loader"),
+    ]
+    where = placed(arrange(nodes), nodes)
+    leftmost = min(round(p[0]) for p in where.values())
+    assert round(where["loader"][0]) == round(where["b"][0]), (
+        "the loader belongs beside the other thing feeding the sink"
+    )
+    assert round(where["loader"][0]) != leftmost
+
+
+def test_a_node_faces_the_middle_of_what_it_feeds() -> None:
+    """Rows are placed against their neighbours, not packed from the top of a column.
+
+    Packing each column from its own top honours the order and ignores the links,
+    which is what turned every one of them into a diagonal.
+    """
+    nodes = [node("src"), node("top", feeds_from=["src"]), node("bottom", feeds_from=["src"])]
+    where = placed(arrange(nodes), nodes)
+    middle = (where["top"][1] + where["bottom"][1]) / 2 + 50
+    assert abs(where["src"][1] + 50 - middle) < 1.0
+
+
+def test_nodes_with_no_links_are_kept_out_of_the_flow() -> None:
+    """A note is not a stage. Left in the layout it holds a row it has no claim to."""
+    nodes = [node("a"), node("b", feeds_from=["a"]), node("note", pos=(0, 4000))]
+    where = placed(arrange(nodes), nodes)
+    assert round(where["note"][0]) < round(where["a"][0])
+    assert where["note"][1] < 1000
+
+
+def test_arranging_twice_changes_nothing_the_second_time() -> None:
+    """One call is one undo step, so a second one must not be an edit at all."""
+    nodes = [
+        node("a"),
+        node("b", feeds_from=["a"]),
+        node("c", feeds_from=["b"]),
+        node("loose", pos=(0, 3000)),
+    ]
+    first = arrange(nodes)["positions"]
+    for n in nodes:
+        if n["id"] in first:
+            n["pos"] = list(first[n["id"]])
+    assert arrange(nodes)["positions"] == {}
+
+
+def test_a_group_is_laid_out_as_a_block_rather_than_scattered() -> None:
+    """A group box follows its members, so members that scatter make a box that swallows the canvas.
+
+    Measured on a real workflow: arranging it flat turned a 670x670 group into
+    6130x900 and left eight of them overlapping across everything.
+    """
+    nodes = [
+        node("a1"),
+        node("a2", feeds_from=["a1"]),
+        node("b1", feeds_from=["a2"]),
+        node("b2", feeds_from=["b1"]),
+    ]
+    groups = [{"id": "A", "nodes": ["a1", "a2"]}, {"id": "B", "nodes": ["b1", "b2"]}]
+    where = placed(arrange(nodes, groups=groups), nodes)
+
+    def span(ids: list[str]) -> tuple[float, float]:
+        return min(where[i][0] for i in ids), max(where[i][0] + 200 for i in ids)
+
+    a_left, a_right = span(["a1", "a2"])
+    b_left, b_right = span(["b1", "b2"])
+    assert a_right <= b_left, "the two groups should not overlap horizontally"
+
+
+def test_arranging_a_subset_ignores_groups() -> None:
+    """`only` already says which nodes are meant; a group half inside it is not a block."""
+    nodes = [node("a"), node("b", feeds_from=["a"])]
+    groups = [{"id": "A", "nodes": ["a", "b", "somebody-else"]}]
+    assert arrange(nodes, groups=groups)["positions"] == arrange(nodes)["positions"]
+
+
+def test_a_single_group_is_no_reason_to_change_anything() -> None:
+    """One block is the flat case wearing a hat."""
+    nodes = [node("a"), node("b", feeds_from=["a"])]
+    groups = [{"id": "A", "nodes": ["a", "b"]}]
+    assert arrange(nodes, groups=groups)["positions"] == arrange(nodes)["positions"]

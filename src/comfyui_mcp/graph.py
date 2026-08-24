@@ -1385,6 +1385,11 @@ def _drop_to_fit(
 
 
 LAYOUT_SPACING_X = 80
+LAYOUT_ORDER_SWEEPS = 8
+LAYOUT_PLACE_ROUNDS = 6
+LAYOUT_GHOST_HEIGHT = 24.0
+LAYOUT_UNLINKED_WEIGHT = 0.25
+LAYOUT_GROUP_PADDING = 30.0
 LAYOUT_SPACING_Y = 40
 
 DEFAULT_NODE_SIZE = (240, 120)
@@ -1475,12 +1480,19 @@ def _without_back_edges(order: list[str], feeds: dict[str, list[str]]) -> dict[s
 
 
 def _layer_of(order: list[str], feeds: dict[str, list[str]]) -> dict[str, int]:
-    """Column index per node: one further right than everything feeding it.
+    """Column index per node: one to the *left* of the nearest thing it feeds.
 
-    Kahn's order first, so a node is only placed once every predecessor has been.
-    `feeds` is expected to be acyclic; the leftover pass is a belt-and-braces
-    guard so an unexpected loop degrades to a poor layout rather than a missing
-    column.
+    The obvious rule is the opposite - one right of everything feeding it - and it
+    is what this did until it was measured. It drags every source to the far left
+    whatever it feeds, so a loader read by one sampler deep in the graph sits in
+    column 0 with all the others: on a 133-node workflow that put 71 nodes in the
+    first column and stretched one link across seventeen of them. Placing a node as
+    late as its consumers allow keeps it beside what reads it, which is both
+    shorter to look at and what the author would have done by hand.
+
+    Sinks have nothing to be left of and go in the last column. `feeds` is expected
+    to be acyclic; the leftover pass is a belt-and-braces guard so an unexpected
+    loop degrades to a poor layout rather than a missing column.
     """
     indegree = {node_id: 0 for node_id in order}
     for targets in feeds.values():
@@ -1499,39 +1511,165 @@ def _layer_of(order: list[str], feeds: dict[str, list[str]]) -> dict[str, int]:
     seen = set(placed)
     placed += [node_id for node_id in order if node_id not in seen]
 
-    layer = {node_id: 0 for node_id in order}
+    depth = {node_id: 0 for node_id in order}
     for node_id in placed:
         for target in feeds[node_id]:
-            layer[target] = max(layer[target], layer[node_id] + 1)
-    return layer
+            depth[target] = max(depth[target], depth[node_id] + 1)
+    last = max(depth.values(), default=0)
+
+    layer: dict[str, int] = {}
+    for node_id in reversed(placed):
+        consumers = [layer[t] for t in feeds.get(node_id, []) if t in layer]
+        layer[node_id] = min(consumers) - 1 if consumers else last
+    lowest = min(layer.values(), default=0)
+    return {node_id: value - lowest for node_id, value in layer.items()}
+
+
+def _crossings_between(columns: list[list[str]], feeds: dict[str, list[str]]) -> int:
+    """Links that cross, counted from the row order alone.
+
+    Only neighbouring columns are compared, which is the whole reason `arrange`
+    stands a placeholder in every column a long link passes through: without one,
+    a link spanning five columns is counted where it ends and ignored everywhere
+    it actually cuts across.
+    """
+    where = {node_id: i for i, column in enumerate(columns) for node_id in column}
+    rows = {node_id: r for column in columns for r, node_id in enumerate(column)}
+    total = 0
+    for i in range(len(columns) - 1):
+        pairs = [
+            (rows[source], rows[target])
+            for source in columns[i]
+            for target in feeds.get(source, [])
+            if where.get(target) == i + 1
+        ]
+        for a in range(len(pairs)):
+            for b in range(a + 1, len(pairs)):
+                if (pairs[a][0] - pairs[b][0]) * (pairs[a][1] - pairs[b][1]) < 0:
+                    total += 1
+    return total
 
 
 def _ordered_rows(
     columns: list[list[str]],
+    feeds: dict[str, list[str]],
     fed_by: dict[str, list[str]],
     current_y: dict[str, float],
-    passes: int = 2,
-) -> None:
+    sweeps: int = LAYOUT_ORDER_SWEEPS,
+) -> int:
     """Sort each column so links cross as little as possible, in place.
 
-    Barycentre ordering: a node sits opposite the average row of what feeds it.
-    Two sweeps is where the returns stop being visible - this is a readability
-    pass, not an optimiser, and a stable result matters more than an optimal one.
+    Barycentre ordering: a node sits opposite the average row of what it connects
+    to. Two things make this work where the earlier version did not. It sweeps
+    *both* ways - ordering only by what feeds a node leaves that node's own
+    consumers with no say, so a source stayed wherever it started and dragged its
+    link across the graph. And it keeps the best round rather than the last:
+    barycentre is a heuristic and a sweep can make things worse, which nothing
+    noticed while the answer was whatever fell out of the final pass.
     """
     for column in columns:
         column.sort(key=lambda node_id: current_y[node_id])
     rows = {node_id: i for column in columns for i, node_id in enumerate(column)}
-    for _ in range(passes):
-        for column in columns:
+
+    best = [list(column) for column in columns]
+    best_score = _crossings_between(columns, feeds)
+
+    for sweep in range(sweeps):
+        forward = sweep % 2 == 0
+        sequence = range(1, len(columns)) if forward else range(len(columns) - 2, -1, -1)
+        neighbours = fed_by if forward else feeds
+        for i in sequence:
+            column = columns[i]
+
             def key(node_id: str) -> tuple[float, float]:
-                sources = [rows[src] for src in fed_by.get(node_id, []) if src in rows]
-                if not sources:
-                    return (rows[node_id], current_y[node_id])
-                return (sum(sources) / len(sources), current_y[node_id])
+                near = [rows[m] for m in neighbours.get(node_id, []) if m in rows]
+                return (sum(near) / len(near) if near else rows[node_id], rows[node_id])
 
             column.sort(key=key)
-            for i, node_id in enumerate(column):
-                rows[node_id] = i
+            for row, node_id in enumerate(column):
+                rows[node_id] = row
+        score = _crossings_between(columns, feeds)
+        if score < best_score:
+            best_score, best = score, [list(column) for column in columns]
+
+    for column, winner in zip(columns, best):
+        column[:] = winner
+    return best_score
+
+
+def _isotonic(desired: list[float], weights: list[float]) -> list[float]:
+    """The closest non-decreasing sequence to `desired`, by weighted least squares.
+
+    Pool-adjacent-violators. The rows in a column already have their order decided,
+    so the only question left is where each one sits, and this answers it exactly:
+    every node as near as possible to where its links want it, subject to still
+    coming after the one above it.
+    """
+    blocks: list[list[float]] = []
+    for value, weight in zip(desired, weights):
+        blocks.append([value, weight, 1])
+        while len(blocks) > 1 and blocks[-2][0] >= blocks[-1][0]:
+            value_b, weight_b, size_b = blocks.pop()
+            value_a, weight_a, size_a = blocks.pop()
+            total = weight_a + weight_b
+            blocks.append([
+                (value_a * weight_a + value_b * weight_b) / total,
+                total,
+                size_a + size_b,
+            ])
+    out: list[float] = []
+    for value, _, size in blocks:
+        out.extend([value] * int(size))
+    return out
+
+
+def _place_rows(
+    columns: list[list[str]],
+    boxes: dict[str, tuple[float, float, float, float]],
+    feeds: dict[str, list[str]],
+    fed_by: dict[str, list[str]],
+    spacing_y: float,
+    rounds: int = LAYOUT_PLACE_ROUNDS,
+) -> dict[str, float]:
+    """Choose a height for every node, near the middle of what it connects to.
+
+    The order within a column is already settled; this is only coordinates, and it
+    is the half the earlier version skipped entirely. Packing each column from its
+    own top and centring the columns against one another honours the order and
+    ignores the links, which is what turned every one of them into a diagonal -
+    measured at three to five times the edge length of the author's own layout.
+    """
+    y: dict[str, float] = {}
+    for column in columns:
+        top = 0.0
+        for node_id in column:
+            y[node_id] = top
+            top += boxes[node_id][3] + spacing_y
+
+    for round_no in range(rounds):
+        sequence = range(len(columns)) if round_no % 2 == 0 else range(len(columns) - 1, -1, -1)
+        for i in sequence:
+            column = columns[i]
+            desired: list[float] = []
+            weights: list[float] = []
+            offsets: list[float] = []
+            run = 0.0
+            for node_id in column:
+                height = boxes[node_id][3]
+                near = [m for m in fed_by.get(node_id, []) if m in y]
+                near += [m for m in feeds.get(node_id, []) if m in y]
+                if near:
+                    middle = sum(y[m] + boxes[m][3] / 2 for m in near) / len(near)
+                    want, weight = middle - height / 2, float(len(near))
+                else:
+                    want, weight = y[node_id], LAYOUT_UNLINKED_WEIGHT
+                desired.append(want - run)
+                weights.append(weight)
+                offsets.append(run)
+                run += height + spacing_y
+            for node_id, value, offset in zip(column, _isotonic(desired, weights), offsets):
+                y[node_id] = value + offset
+    return y
 
 
 def arrange(
@@ -1539,6 +1677,7 @@ def arrange(
     spacing_x: float = LAYOUT_SPACING_X,
     spacing_y: float = LAYOUT_SPACING_Y,
     origin: tuple[float, float] | None = None,
+    groups: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Lay nodes out left to right, in the order the data flows through them.
 
@@ -1546,13 +1685,49 @@ def arrange(
     a handful of nodes and leaving the rest alone is the common case, and a subset
     simply has fewer edges to honour.
 
+    Pass `groups` and the layout runs twice - once inside each group, once over the
+    blocks they make - which is what keeps a grouped canvas readable. Without it a
+    group's nodes scatter across columns and its box stretches to follow them.
+
     Returns the positions to write, with nodes that are already where they belong
     left out, so the caller can see how much of a change this is before making it.
     """
     if not nodes:
         return {"positions": {}, "columns": 0, "moved": 0, "unchanged": 0, "bounds": None}
 
-    order = [str(node.get("id")) for node in nodes]
+    if groups:
+        placed, columns, bounds = _blocks_layout(nodes, groups, spacing_x, spacing_y, origin)
+    else:
+        placed, columns, bounds = _flow_layout(nodes, spacing_x, spacing_y, origin)
+
+    positions: dict[str, list[float]] = {}
+    unchanged = 0
+    for node in nodes:
+        node_id = str(node.get("id"))
+        was = _node_box(node)
+        where = placed[node_id]
+        if [round(was[0]), round(was[1])] == where:
+            unchanged += 1
+        else:
+            positions[node_id] = where
+    return {
+        "positions": positions,
+        "columns": columns,
+        "moved": len(positions),
+        "unchanged": unchanged,
+        "bounds": bounds,
+    }
+
+
+def _flow_layout(
+    nodes: list[dict[str, Any]],
+    spacing_x: float,
+    spacing_y: float,
+    origin: tuple[float, float] | None,
+) -> tuple[dict[str, list[float]], int, list[float]]:
+    """Where every node goes, whether or not that is where it already is."""
+    every = [str(node.get("id")) for node in nodes]
+    order = list(every)
     boxes = {str(node.get("id")): _node_box(node) for node in nodes}
     feeds = _without_back_edges(order, _layout_edges(nodes))
     fed_by: dict[str, list[str]] = {node_id: [] for node_id in boxes}
@@ -1560,48 +1735,178 @@ def arrange(
         for target in targets:
             fed_by[target].append(source)
 
+    loose = [node_id for node_id in order if not feeds[node_id] and not fed_by[node_id]]
+    if loose and len(loose) < len(order):
+        for node_id in loose:
+            order.remove(node_id)
+            feeds.pop(node_id, None)
+            fed_by.pop(node_id, None)
+    else:
+        loose = []
+
     layer = _layer_of(order, feeds)
-    buckets: list[list[str]] = [[] for _ in range(max(layer.values()) + 1)]
+
+    ghosts: dict[str, int] = {}
+    for source in list(feeds):
+        for target in list(feeds[source]):
+            if layer[target] - layer[source] <= 1:
+                continue
+            feeds[source].remove(target)
+            fed_by[target].remove(source)
+            previous = source
+            for column_index in range(layer[source] + 1, layer[target]):
+                ghost = f"~{source}>{target}@{column_index}"
+                ghosts[ghost] = column_index
+                boxes[ghost] = (0.0, 0.0, 1.0, LAYOUT_GHOST_HEIGHT)
+                layer[ghost] = column_index
+                feeds.setdefault(ghost, [])
+                fed_by.setdefault(ghost, [])
+                feeds[previous].append(ghost)
+                fed_by[ghost].append(previous)
+                previous = ghost
+            feeds[previous].append(target)
+            fed_by[target].append(previous)
+
+    buckets: list[list[str]] = [[] for _ in range(max(layer.values(), default=0) + 1)]
     for node in nodes:
         node_id = str(node.get("id"))
-        buckets[layer[node_id]].append(node_id)
+        if node_id in layer:
+            buckets[layer[node_id]].append(node_id)
+    for ghost, column_index in ghosts.items():
+        buckets[column_index].append(ghost)
     columns = [column for column in buckets if column]
+    if loose:
+        columns.insert(0, loose)
 
     current_y = {node_id: box[1] for node_id, box in boxes.items()}
-    _ordered_rows(columns, fed_by, current_y)
+    for ghost in ghosts:
+        current_y[ghost] = 0.0
 
-    left = origin[0] if origin else min(box[0] for box in boxes.values())
-    top = origin[1] if origin else min(box[1] for box in boxes.values())
+    _ordered_rows(columns, feeds, fed_by, current_y)
+    heights = _place_rows(columns, boxes, feeds, fed_by, spacing_y)
 
-    heights = [
-        sum(boxes[node_id][3] for node_id in column) + spacing_y * (len(column) - 1)
-        for column in columns
-    ]
-    tallest = max(heights)
+    left = origin[0] if origin else min(boxes[node_id][0] for node_id in every)
+    top = origin[1] if origin else min(boxes[node_id][1] for node_id in every)
+    lift = top - min(heights.values())
 
-    positions: dict[str, list[float]] = {}
-    unchanged = 0
+    placed: dict[str, list[float]] = {}
     x = left
-    for column, height in zip(columns, heights):
-        y = top + (tallest - height) / 2
-        for node_id in column:
-            was_x, was_y, _, node_h = boxes[node_id]
-            place = [round(x), round(y)]
-            if [round(was_x), round(was_y)] == place:
-                unchanged += 1
-            else:
-                positions[node_id] = place
-            y += node_h + spacing_y
-        x += max(boxes[node_id][2] for node_id in column) + spacing_x
+    lowest = top
+    for column in columns:
+        real = [node_id for node_id in column if node_id not in ghosts]
+        if not real:
+            continue
+        for node_id in real:
+            place = [round(x), round(heights[node_id] + lift)]
+            lowest = max(lowest, place[1] + boxes[node_id][3])
+            placed[node_id] = place
+        x += max(boxes[node_id][2] for node_id in real) + spacing_x
 
-    return {
-        "positions": positions,
-        "columns": len(columns),
-        "moved": len(positions),
-        "unchanged": unchanged,
-        "bounds": [round(left), round(top), round(x - spacing_x - left), round(tallest)],
-    }
+    bounds = [round(left), round(top), round(x - spacing_x - left), round(lowest - top)]
+    return placed, len(columns), bounds
 
+
+def _blocks_layout(
+    nodes: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    spacing_x: float,
+    spacing_y: float,
+    origin: tuple[float, float] | None,
+) -> tuple[dict[str, list[float]], int, list[float]]:
+    """Lay each group out inside itself, then lay the groups out among themselves.
+
+    A group is a rectangle with no membership - what is "in" it is whatever falls
+    inside - so arranging the whole canvas flat spreads one group's nodes across
+    several columns and its box stretches to reach them. Measured on a real
+    workflow: a 670x670 group became 6130x900, and eight of them ended up as
+    overlapping sheets covering everything. The links were tidier and the canvas
+    was unreadable, which is the whole lesson - crossings are not what a person
+    sees first.
+
+    Groups are the structure their author built by hand, and this keeps it: the
+    same layout runs twice, once within each group and once over the blocks they
+    form. Ungrouped nodes travel together as one more block.
+    """
+    by_id = {str(node.get("id")): node for node in nodes}
+
+    claimed: dict[str, str] = {}
+    blocks: list[tuple[str, list[str]]] = []
+    for index, group in enumerate(groups):
+        members = [
+            str(node_id)
+            for node_id in (group.get("nodes") or [])
+            if str(node_id) in by_id and str(node_id) not in claimed
+        ]
+        if not members:
+            continue
+        label = f"@group{index}"
+        for member in members:
+            claimed[member] = label
+        blocks.append((label, members))
+
+    ungrouped = [node_id for node_id in by_id if node_id not in claimed]
+    if ungrouped:
+        blocks.append(("@loose", ungrouped))
+
+    if len(blocks) < 2:
+        return _flow_layout(nodes, spacing_x, spacing_y, origin)
+
+    inner: dict[str, dict[str, list[float]]] = {}
+    extent: dict[str, tuple[float, float]] = {}
+    corner: dict[str, tuple[float, float]] = {}
+    for label, members in blocks:
+        subset = [by_id[member] for member in members]
+        placed, _, _ = _flow_layout(subset, spacing_x, spacing_y, (0.0, 0.0))
+        inner[label] = placed
+        width = max(placed[m][0] + _node_box(by_id[m])[2] for m in members)
+        height = max(placed[m][1] + _node_box(by_id[m])[3] for m in members)
+        extent[label] = (width, height)
+        corner[label] = (
+            min(_node_box(by_id[m])[0] for m in members),
+            min(_node_box(by_id[m])[1] for m in members),
+        )
+
+    feeds_between: dict[str, set[str]] = {label: set() for label, _ in blocks}
+    for node in nodes:
+        target = claimed.get(str(node.get("id")), "@loose")
+        for slot in node.get("inputs") or []:
+            link = slot.get("from")
+            if not link:
+                continue
+            source = claimed.get(str(link.get("node")))
+            if source is None or source == target:
+                continue
+            feeds_between[source].add(target)
+
+    pseudo = [
+        {
+            "id": label,
+            "pos": [corner[label][0], corner[label][1]],
+            "size": [
+                extent[label][0] + 2 * LAYOUT_GROUP_PADDING,
+                extent[label][1] + 2 * LAYOUT_GROUP_PADDING,
+            ],
+            "inputs": [
+                {"name": f"in{i}", "from": {"node": source, "slot": 0}}
+                for i, source in enumerate(
+                    sorted(s for s, targets in feeds_between.items() if label in targets)
+                )
+            ],
+        }
+        for label, _ in blocks
+    ]
+    where, columns, bounds = _flow_layout(pseudo, spacing_x, spacing_y, origin)
+
+    placed_all: dict[str, list[float]] = {}
+    for label, members in blocks:
+        block_x, block_y = where[label]
+        for member in members:
+            offset = inner[label][member]
+            placed_all[member] = [
+                round(block_x + LAYOUT_GROUP_PADDING + offset[0]),
+                round(block_y + LAYOUT_GROUP_PADDING + offset[1]),
+            ]
+    return placed_all, columns, bounds
 
 ALIGN_EDGES = ("left", "right", "top", "bottom", "centre_x", "centre_y")
 

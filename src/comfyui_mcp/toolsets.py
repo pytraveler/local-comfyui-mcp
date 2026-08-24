@@ -10,7 +10,7 @@ then lies about itself.
 
 Three reasons this exists, and only the last is about safety:
 
-*Context.* All 48 schemas reach the model at the start of every session. Somebody
+*Context.* All 50 schemas reach the model at the start of every session. Somebody
 who only ever runs workflow files pays for twenty canvas tools they never call.
 
 *The decision is made when nobody is in a hurry.* A permission prompt raised in
@@ -174,6 +174,27 @@ GROUPS: tuple[Group, ...] = (
                 "Один вызов - один Ctrl+Z, и стек отмены общий с вашим. "
                 "Исключение - load_workspace: он заменяет холст целиком, и отменить это нельзя "
                 "(перед заменой пишется резервная копия в exports/)."
+            ),
+        ),
+    ),
+    Group(
+        name="ask",
+        title=Text(en="Asking the user", ru="Вопрос пользователю"),
+        risk="reads",
+        summary=Text(
+            en="Put a question on the ComfyUI screen and wait for the person to answer it.",
+            ru="Показать вопрос в окне ComfyUI и дождаться ответа человека.",
+        ),
+        warning=Text(
+            en=(
+                "Interrupts whoever is at the screen and blocks the call until they answer, "
+                "dismiss it or the wait runs out. One question at a time: the frontend keys "
+                "every dialog alike, so a second one could never be answered."
+            ),
+            ru=(
+                "Прерывает того, кто за экраном, и держит вызов до ответа, отмены или "
+                "истечения ожидания. Вопрос строго один за раз: фронтенд метит все диалоги "
+                "одинаково, и на второй ответить было бы уже нельзя."
             ),
         ),
     ),

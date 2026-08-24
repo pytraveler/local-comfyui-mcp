@@ -4,9 +4,14 @@
 
 [English](README.md) | [Русский](README.ru.md) | [История изменений](CHANGELOG.ru.md)
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.13-blue)
-![Tools](https://img.shields.io/badge/tools-48-green)
+<p align="center">
+  <a href="https://github.com/pytraveler/local-comfyui-mcp/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/pytraveler/local-comfyui-mcp?display_name=tag"></a>
+  <a href="LICENSE"><img alt="Лицензия" src="https://img.shields.io/github/license/pytraveler/local-comfyui-mcp"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <img alt="50 инструментов" src="https://img.shields.io/badge/tools-50-2ea44f">
+  <a href="https://modelcontextprotocol.io"><img alt="MCP-сервер" src="https://img.shields.io/badge/MCP-server-6E4AFF"></a>
+  <a href="https://github.com/comfyanonymous/ComfyUI"><img alt="Управляет локальным ComfyUI" src="https://img.shields.io/badge/ComfyUI-local-1B98E0"></a>
+</p>
 
 ---
 
@@ -33,6 +38,12 @@ HTTP-API ComfyUI знает про файлы, модели и очередь. �
 значения виджетов, перекладывать связи, наводить порядок в раскладке, снимать
 скриншот холста и ставить воркфлоу в очередь ровно так, как это делает кнопка
 Queue.
+
+Канал работает и в обратную сторону. Вопрос можно показать прямо в окне ComfyUI и
+ответить на него там же - под холстом, а не поверх него: граф видно, и с ним можно
+работать, пока вы решаете. Ради этого всё и затевалось - вопрос, который стоит
+задавать, звучит как "посмотрите и скажите", а модальное окно закрывает как раз то,
+на что надо посмотреть.
 
 Всё остальное работает и без него, а инструменты прямо говорят, какого из двух
 шагов установки не хватает, вместо невнятной ошибки.
@@ -104,7 +115,7 @@ Junction (симлинк на Unix) в `custom_nodes`, так что второ�
 при старте. Дальше достаточно открыть вкладку; `workspace_status` скажет, обе ли
 половины на месте.
 
-## Что умеют 48 инструментов
+## Что умеют 50 инструментов
 
 | Группа | Для чего |
 |---|---|
@@ -113,6 +124,7 @@ Junction (симлинк на Unix) в `custom_nodes`, так что второ�
 | **Логи** | собственная консоль ComfyUI и консоль браузера - единственное место, где упавшее расширение вообще о себе говорит |
 | **Холст: чтение** | живой граф, его скриншот, список открытых вкладок, диагноз того, что с ним не так |
 | **Холст: правка** | значения виджетов, свойства, подписи на экране, связи, режимы нод, раскладка, группы, отмена |
+| **Вопрос пользователю** | показать вопрос в окне ComfyUI и дождаться ответа человека |
 | **Запуск** | запустить файл или холст, следить за прогрессом, забрать результат, показать картинку |
 | **Загрузка моделей** | скачать модель в тот каталог, который ComfyUI действительно читает, с прогрессом |
 | **Процесс и вкладка** | запустить, остановить или перезапустить ComfyUI; перезагрузить вкладку |

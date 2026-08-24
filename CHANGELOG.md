@@ -8,6 +8,103 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
+## 0.1.7 - 2026-08-24
+
+### Added
+
+- **`ask_workspace` and `confirm_workspace`: put a question on the ComfyUI screen
+  and wait for the person to answer it.** The first tools here whose answer comes
+  from a human rather than from the graph, for the step that turns on something
+  only they know - which of two results they preferred, whether a value looks
+  right - instead of guessing and building on the guess. They open the frontend's
+  own dialogs through `app.extensionManager.dialog`, so nothing is drawn by hand.
+
+  **The question goes below the canvas, not over it.** A dialog is modal and closes
+  on a click beside it, so on the question most worth asking - "look at this and
+  tell me" - looking is what cancels it. The default surface is a bottom panel tab,
+  which covers nothing and dismisses on nothing, so the graph can be panned and
+  inspected while the question waits. `modal=True` asks in a dialog instead, for
+  something that should interrupt rather than wait to be noticed. The panel draws
+  its own buttons, so yes, no and dismiss are all reachable there whatever `kind`
+  says.
+
+  **`choices` makes it a pick rather than a typing exercise.** One click instead of
+  a sentence, and the answer arrives as one of the strings that were offered rather
+  than as something to parse - with `choice_index` beside it, since two options can
+  read alike once phrased and an index cannot. Six or fewer are buttons, more become
+  a dropdown, and `allow_other` adds a free-text box answering with `-1`. Only the
+  panel can offer them: ComfyUI's dialog service has `prompt` and `confirm` and
+  nothing that picks from a list, and `confirm`'s `itemList` renders a plain `<ul>`
+  that cannot be clicked - so `modal=True` with choices is refused rather than
+  quietly ignored.
+
+  **One question at a time, refused rather than queued.** `prompt` and `confirm`
+  both open through `dialogStore.showDialog` with the *same* key, and showDialog
+  handed a key already in the stack re-shows the dialog that is there and drops
+  the options it was given - including the callbacks the promise is waiting on. A
+  second question would therefore neither appear nor ever be answered, so it is
+  refused, naming the one in the way. ComfyUI's own prompts share that key too.
+
+  **A deadline that leaves nothing dangling.** The wait is bounded and reports
+  `timed_out` with `still_on_screen`, because a question we stopped waiting for is
+  still in front of the user and still holds the dialog. The ordering that matters
+  is dialog < bridge < httpx < the client's own per-call cap.
+
+  **Dismissal is an answer, and not the one you want.** Clicking beside the box
+  closes it, so `null` arrives easily; it is neither yes nor no and is reported as
+  `dismissed` rather than folded into either. For `confirm_workspace` a plain
+  `false` needs a deny button, which ComfyUI draws for `kind="dirtyClose"` alone -
+  every other kind offers Cancel and Confirm, so Cancel lands on `null`. Passing
+  `deny_label` with any other kind is refused instead of doing nothing quietly.
+
+  The `ask` group is switched on by default and can be turned off like any other;
+  a tab that predates it answers `unknown method`, which already means "reload".
+
+### Fixed
+
+- **`arrange_workspace` no longer makes a workflow harder to read than it was.**
+  Measured against the layouts their authors had made by hand, it was producing
+  three to nine times the link crossings and up to five times the total link
+  length - on a 133-node workflow, 527 crossings against the author's 59. Three
+  things were wrong and each is now the other way round.
+
+  A node's column was one past everything feeding it, which drags every source to
+  the far left however deep the thing that reads it sits: 71 of those 133 nodes
+  landed in column 0, and one link was stretched across seventeen columns. A node
+  now goes as far right as its consumers allow, so a loader sits beside the
+  sampler that reads it.
+
+  Row order was decided by looking only at what fed a node, so a node's own
+  consumers had no say and the last sweep won whether or not it helped. It now
+  sweeps both ways and keeps the round with the fewest crossings, and a link
+  spanning several columns gets a placeholder in each one it passes through -
+  without which crossing minimisation cannot see it at all.
+
+  Heights were not chosen: each column was packed from its own top and the columns
+  centred against one another, which honours the order and ignores the links. Every
+  node is now placed as near as it can get to the middle of what it connects to,
+  which is what the vertical travel measures - down from 114k to 11k on that same
+  workflow.
+
+  Nodes with no links at all get a column of their own rather than a row in a flow
+  they are not part of: a note that sat far below the graph used to keep its height
+  and strand the canvas reaching for it.
+
+  **Groups are laid out as groups.** A group box has no membership - what is in it
+  is whatever falls inside - so arranging a grouped canvas flat scatters each
+  group's nodes across the columns and its box stretches to follow them. On a real
+  workflow that turned a 670x670 group into 6130x900 and left eight of them as
+  overlapping sheets covering the canvas: the links were measurably tidier and the
+  result was unreadable, which is the whole lesson about optimising a number. The
+  layout now runs inside each group first and then over the blocks they form, with
+  ungrouped nodes travelling together as one more block. `only` still ignores them,
+  since a caller naming the nodes has already said what they mean.
+
+  The same four workflows now come out at 7, 4, 32 and 65 crossings against 21, 7,
+  59 and 95 by hand. Worth saying plainly: fewer crossings is not the same as
+  prettier, and a layered layout still does not group related nodes the way a
+  person does.
+
 ## 0.1.6 - 2026-08-23
 
 ### Fixed

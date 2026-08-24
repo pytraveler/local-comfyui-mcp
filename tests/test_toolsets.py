@@ -12,6 +12,8 @@ them.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from comfyui_mcp import toolsets as T
@@ -200,7 +202,23 @@ def real() -> list[T.Tool]:
 
 
 def test_every_tool_the_server_defines_is_in_the_registry():
-    assert len(real()) >= 44
+    """What the MCP server offers and what the registry knows about are one set.
+
+    This was a floor - `>= 44` - which is not the statement the name makes and
+    went stale the moment a tool was added. Asking the server itself is exact and
+    cannot drift: a tool registered through `mcp.tool()` directly rather than
+    through `server.tool(group, risk)` would be offered to the model while being
+    invisible to the settings window, which is the failure worth catching.
+
+    Compared against the *enabled* half of the registry, since a switched-off tool
+    is deliberately never registered - so this holds under any `COMFYUI_TOOLS`.
+    """
+    import asyncio
+
+    from comfyui_mcp import server as S
+
+    offered = {tool.name for tool in asyncio.run(S.mcp.list_tools())}
+    assert offered == {entry.name for entry in real() if entry.enabled}
 
 
 def test_every_group_still_has_tools_in_it():
@@ -263,3 +281,46 @@ def test_saving_writes_a_spec_the_loader_reads_back(tmp_path, monkeypatch):
     assert C.load_config().tools == spec
     selection = T.parse(spec)
     assert {t.name for t in real() if selection.allows(t.name, t.group)} == keep
+
+
+COUNTED_IN_DOCS = (
+    ("README.md", r"tools-(\d+)-"),
+    ("README.md", r"the (\d+) tools cover"),
+    ("README.ru.md", r"tools-(\d+)-"),
+    ("README.ru.md", r"умеют (\d+) инструмент"),
+    ("README_dev.md", r"всех (\d+) инструментов"),
+    ("CLAUDE.md", r"all (\d+) schemas"),
+    ("CLAUDE.md", r"all (\d+) tool"),
+    ("src/comfyui_mcp/i18n.py", r"All (\d+) tool docstrings"),
+    ("src/comfyui_mcp/toolsets.py", r"All (\d+) schemas reach"),
+)
+
+
+def test_the_documentation_still_says_how_many_tools_there_are():
+    """Every place the count is written down has to agree with the registry.
+
+    Nothing here holds a list of tools - `tool(group, risk)` records them as
+    server.py imports - and that rule is what keeps the settings window honest.
+    The *count* escaped it: it is written out in nine places across six files,
+    and a tool added tomorrow makes all nine wrong with nothing to say so. Four
+    of them had already drifted by the time this was written, two of those in
+    module docstrings that no check had ever pointed at.
+    """
+    import re
+
+    import comfyui_mcp.server  # noqa: F401 - importing is what fills the registry
+
+    total = sum(len(group["tools"]) for group in T.catalogue()["groups"])
+    assert total, "the registry is empty, so this test would pass on anything"
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for name, pattern in COUNTED_IN_DOCS:
+        path = root / name
+        if not path.exists():
+            continue
+        found = re.findall(pattern, path.read_text(encoding="utf-8"))
+        assert found, f"{name} no longer states the tool count as {pattern!r}"
+        for written in found:
+            assert int(written) == total, (
+                f"{name} says {written} tools, the registry has {total}"
+            )

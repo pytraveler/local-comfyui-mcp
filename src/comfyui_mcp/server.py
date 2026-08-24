@@ -1170,6 +1170,233 @@ async def save_workspace(
     return saved
 
 
+ASK_MAX_SECONDS = 600
+ASK_MAX_CHOICES = 20
+
+
+def _ask_deadline(seconds: float) -> float:
+    """How long to let the HTTP call run for a question aimed at a human.
+
+    The bridge's deadline has to outlast the dialog's, or httpx gives up first and
+    replaces a useful answer with a bare read timeout - the rule
+    `test_http_deadline_outlasts_the_bridge_deadline` already pins for every other
+    method. Here the innermost wait is a person, so the ordering runs
+    dialog < bridge < httpx < the client's own per-call cap, and that last one is
+    `COMFYUI_RUN_TIMEOUT` plus a margin in the generated client configs.
+    """
+    return seconds + CFG.bridge_timeout
+
+
+@tool("ask", "reads")
+async def ask_workspace(
+    question: str,
+    title: str = "",
+    default: str = "",
+    placeholder: str = "",
+    choices: list[str] | None = None,
+    allow_other: bool = False,
+    modal: bool = False,
+    seconds: float = 120,
+    client_id: str = "",
+) -> dict[str, Any]:
+    """Ask the person at the ComfyUI screen a question, and wait for their answer.
+
+    This is the one tool whose answer comes from a human rather than from the
+    graph. Reach for it when the next step turns on something only they know -
+    which of two results they preferred, what the subject of a prompt should be,
+    whether a value looks right - instead of guessing and building on the guess.
+
+    **The question goes in a panel below the canvas, not over it.** That matters
+    for the question most worth asking - "look at this and tell me" - because a
+    modal dialog hides the canvas *and* closes on a click beside it, so looking is
+    what cancels it. In the panel the graph stays visible and usable, and they can
+    pan around before answering. `modal=True` puts it back in a dialog for a
+    question that should interrupt rather than wait to be noticed.
+
+    It costs them an interruption either way, so it is worth one question rather
+    than three: only one can be waiting at a time, on either surface, and a second
+    call while one is open is refused rather than queued.
+
+    **`choices` turns it into a pick, which is the cheaper question to answer.**
+    One click instead of typing, and the answer comes back as one of the strings
+    you offered rather than something to parse - with `choice_index` beside it,
+    because two options can read alike once phrased and an index cannot. Up to six
+    are drawn as buttons and more become a dropdown. Choices need the panel: a
+    dialog has no way to offer them, so `modal=True` with `choices` is refused.
+
+    `allow_other` adds a free-text box beside the buttons, for when the list may
+    not cover it; the answer then comes back with `choice_index: -1`. Leave it off
+    when the options really are exhaustive - it is one more thing on screen.
+
+    Three outcomes, and they mean different things. `answer` is what they typed
+    or picked.
+    `dismissed` means they closed the box without answering - easy to do by
+    accident, since clicking beside it counts, so it is not a "no" and not
+    permission to carry on regardless. `timed_out` means the wait ran out with the
+    question still on screen; they may yet answer it, and until they do, another
+    question cannot be asked.
+
+    Args:
+        question: what to ask. Shown as the body of the dialog.
+        title: heading above it. Defaults to "Question".
+        default: text the input starts with, for when there is an obvious answer.
+        placeholder: grey hint inside an empty input, or in the `allow_other` box.
+        choices: options to offer instead of a text box. Each is a button (or an
+            entry in a dropdown past six of them) and answering picks one.
+        allow_other: add a free-text box beside the choices, answering with
+            `choice_index: -1`. Ignored when there are no choices.
+        modal: ask in a dialog over the canvas instead of the panel below it.
+            Harder to miss, but it hides the graph and a stray click dismisses it,
+            so it suits a question whose answer needs nothing on screen.
+        seconds: how long to wait, 1 to 600. Keep it well under the per-call
+            timeout your MCP client enforces, or the client gives up first.
+        client_id: which tab to ask; defaults to the most recently focused one.
+    """
+    if not question.strip():
+        raise ComfyError("question is empty; there is nothing to put on screen")
+    if not 1 <= seconds <= ASK_MAX_SECONDS:
+        raise ComfyError(f"seconds must be between 1 and {ASK_MAX_SECONDS}, got {seconds}")
+
+    picks = [str(c).strip() for c in (choices or [])]
+    if any(not c for c in picks):
+        raise ComfyError("a blank choice cannot be labelled, so it cannot be offered")
+    if len(picks) == 1:
+        raise ComfyError(
+            "one choice is not a choice - it is a confirmation. Offer a second option, "
+            "or use confirm_workspace."
+        )
+    if len(picks) > ASK_MAX_CHOICES:
+        raise ComfyError(f"at most {ASK_MAX_CHOICES} choices, got {len(picks)}")
+    if picks and modal:
+        raise ComfyError(
+            "a dialog cannot offer choices - ComfyUI has prompt and confirm and nothing that "
+            "picks from a list. Drop modal, and the panel draws the buttons."
+        )
+    if allow_other and not picks:
+        raise ComfyError("allow_other adds a box beside the choices, and there are none")
+
+    reply = await BRIDGE.call(
+        "ask",
+        {
+            "question": question,
+            "title": title,
+            "default": default,
+            "placeholder": placeholder,
+            "choices": picks,
+            "allow_other": allow_other,
+            "modal": modal,
+            "seconds": seconds,
+        },
+        timeout=_ask_deadline(seconds),
+        client_id=client_id,
+    )
+    result = reply.get("result") or {}
+    answered: dict[str, Any] = {"client_id": reply.get("client_id"), **result}
+    if result.get("timed_out"):
+        answered["hint"] = (
+            "the question is still on screen and still holds the dialog, so another one "
+            "cannot be asked until it is answered or dismissed"
+        )
+    elif result.get("dismissed"):
+        answered["hint"] = (
+            "they closed the box without answering - which a stray click also does. "
+            "That is not agreement; ask again or proceed on something you already know"
+        )
+    return answered
+
+
+CONFIRM_KINDS = ("default", "delete", "overwrite", "dirtyClose", "reinstall")
+CONFIRM_KIND_WITH_DENY = "dirtyClose"
+
+
+@tool("ask", "reads")
+async def confirm_workspace(
+    question: str,
+    title: str = "",
+    hint: str = "",
+    deny_label: str = "",
+    kind: str = "default",
+    modal: bool = False,
+    seconds: float = 120,
+    client_id: str = "",
+) -> dict[str, Any]:
+    """Ask the person at the ComfyUI screen a yes/no question, and wait.
+
+    The same interruption as ask_workspace, for when the answer is a decision
+    rather than a value - before something slow, or something with no undo.
+
+    Asked in the panel below the canvas by default, so the graph stays visible;
+    `modal=True` puts it in a dialog over it. In the panel all three answers always
+    have a button. In a dialog they do not:
+
+    **`confirmed` has three values, and which are reachable depends on `kind`.**
+    True is agreement and null is dismissal - they closed the box, which says only
+    that they did not engage with the question, and must not be read as either
+    answer. A plain false needs a *deny* button, and ComfyUI draws one for
+    `dirtyClose` and nothing else: every other kind offers Cancel and Confirm, so
+    Cancel answers null and false never arrives. Ask for `dirtyClose` when telling
+    "no" from "never mind" actually matters.
+
+    Args:
+        question: what to ask.
+        title: heading above it. Defaults to "Confirm".
+        hint: smaller helper text under the question.
+        deny_label: caption for the deny button. Only `kind="dirtyClose"` has one,
+            so this is refused with any other kind rather than silently ignored.
+        modal: ask in a dialog over the canvas instead of the panel below it.
+            `kind` and `deny_label` describe ComfyUI's dialog and apply only then;
+            the panel always offers Yes, No and Dismiss.
+        kind: which of ComfyUI's confirmation dialogs to use - "default",
+            "delete" and "overwrite" style the confirming button for a
+            destructive act, "dirtyClose" is the three-way one, "reinstall" is
+            ComfyUI's own. Only the wording and the buttons differ; nothing here
+            acts on the answer.
+        seconds: how long to wait, 1 to 600.
+        client_id: which tab to ask; defaults to the most recently focused one.
+    """
+    if not question.strip():
+        raise ComfyError("question is empty; there is nothing to put on screen")
+    if not 1 <= seconds <= ASK_MAX_SECONDS:
+        raise ComfyError(f"seconds must be between 1 and {ASK_MAX_SECONDS}, got {seconds}")
+    if kind not in CONFIRM_KINDS:
+        raise ComfyError(f"kind must be one of {', '.join(CONFIRM_KINDS)}, got {kind!r}")
+    if deny_label and modal and kind != CONFIRM_KIND_WITH_DENY:
+        raise ComfyError(
+            f"deny_label only captions the deny button, which ComfyUI draws for "
+            f"kind={CONFIRM_KIND_WITH_DENY!r} alone - with kind={kind!r} there is no such "
+            f"button and the label would do nothing. Pass kind={CONFIRM_KIND_WITH_DENY!r}, "
+            f"or drop deny_label."
+        )
+
+    reply = await BRIDGE.call(
+        "confirm",
+        {
+            "question": question,
+            "title": title,
+            "hint": hint,
+            "deny_label": deny_label,
+            "kind": kind,
+            "modal": modal,
+            "seconds": seconds,
+        },
+        timeout=_ask_deadline(seconds),
+        client_id=client_id,
+    )
+    result = reply.get("result") or {}
+    answered: dict[str, Any] = {"client_id": reply.get("client_id"), **result}
+    if result.get("timed_out"):
+        answered["hint"] = "the question is still on screen; no other question can be asked yet"
+    elif result.get("dismissed"):
+        answered["hint"] = (
+            "they closed it rather than answering - neither yes nor no. With "
+            f"kind={kind!r} the only buttons are Cancel and Confirm, so Cancel lands here too; "
+            f"ask again with kind={CONFIRM_KIND_WITH_DENY!r} if an explicit 'no' matters"
+            if kind != CONFIRM_KIND_WITH_DENY
+            else "they closed it rather than answering - neither yes nor no"
+        )
+    return answered
+
+
 UNDO_MAX_STEPS = 50
 
 
@@ -2177,15 +2404,23 @@ async def arrange_workspace(
 ) -> dict[str, Any]:
     """Lay the workflow out left to right, in the order the data flows through it.
 
-    Each node is placed one column past everything feeding it, and the nodes in a
-    column are ordered to face what they are wired to, so links run forwards and
-    cross as little as possible. The block keeps the top-left corner it already
-    had, so it lands where the author left it rather than at the origin.
+    Each node goes as far right as its consumers allow, so a loader sits beside the
+    sampler that reads it rather than in a column of loaders at the far edge, and
+    the nodes in a column are ordered and placed to face what they are wired to.
+    The result keeps the top-left corner it already had, so it lands where the
+    author left it rather than at the origin.
 
-    Reaches for the whole graph by default, which is the blunt instrument: it will
-    move everything, and a group whose members end up far apart becomes a large
-    box around them. Prefer `only` with one group's nodes at a time - that leaves
-    the rest of the canvas untouched and keeps each block inside its own group.
+    **Groups are laid out as groups.** A group is a rectangle with no membership -
+    what is in it is whatever falls inside - so arranging a grouped canvas flat
+    scatters each group across the columns and its box stretches to follow, which
+    on a real workflow turned eight tidy groups into overlapping sheets covering
+    everything. So the layout runs inside each group first and then over the blocks
+    they form, and ungrouped nodes travel together as one more block.
+
+    It still moves every node it is given, which is the blunt instrument. `only`
+    is the narrow one: it arranges just those nodes and leaves the rest of the
+    canvas alone - and since the caller has already said which nodes they mean,
+    groups are not consulted in that case.
 
     Args:
         only: node ids to arrange, leaving every other node where it is. Links to
@@ -2235,6 +2470,7 @@ async def arrange_workspace(
         spacing_x=spacing_x,
         spacing_y=spacing_y,
         origin=(origin[0], origin[1]) if origin else None,
+        groups=None if only else (result.get("groups") or None),
     )
     report = {
         "client_id": reply.get("client_id"),

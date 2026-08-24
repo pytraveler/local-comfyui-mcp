@@ -963,7 +963,7 @@ def test_arranging_reads_then_writes(monkeypatch):
     # a real workflow is most of a megabyte of prompts and lora lists.
     assert calls[0]["params"]["widgets"] is False
     assert calls[1]["params"]["positions"] == result["positions"]
-    assert result["applied"] is True and result["columns"] == 2
+    assert result["applied"] is True and result["columns"] == 3
 
 
 def test_arranging_can_report_a_plan_without_touching_the_canvas(monkeypatch):

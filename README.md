@@ -4,9 +4,14 @@
 
 [English](README.md) | [Русский](README.ru.md) | [Changelog](CHANGELOG.md)
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.13-blue)
-![Tools](https://img.shields.io/badge/tools-48-green)
+<p align="center">
+  <a href="https://github.com/pytraveler/local-comfyui-mcp/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/pytraveler/local-comfyui-mcp?display_name=tag"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/pytraveler/local-comfyui-mcp"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <img alt="50 tools" src="https://img.shields.io/badge/tools-50-2ea44f">
+  <a href="https://modelcontextprotocol.io"><img alt="MCP server" src="https://img.shields.io/badge/MCP-server-6E4AFF"></a>
+  <a href="https://github.com/comfyanonymous/ComfyUI"><img alt="Drives a local ComfyUI" src="https://img.shields.io/badge/ComfyUI-local-1B98E0"></a>
+</p>
 
 ---
 
@@ -32,6 +37,11 @@ The bridge turns the WebSocket ComfyUI already holds open to every client into a
 request/response channel, so an assistant can read the live graph, change widget
 values, rewire links, tidy the layout, take a screenshot of the canvas, and queue
 the workflow the same way the Queue button does.
+
+It also goes the other way. A question can be put on the ComfyUI screen and
+answered there - below the canvas rather than over it, so the graph stays visible
+and usable while you decide. That is the whole point: the question worth asking
+is "look at this and tell me", and a modal box covers the thing to look at.
 
 Everything else works without it, and the tools say plainly which of the two
 setup steps is missing rather than failing vaguely.
@@ -103,7 +113,7 @@ copy to drift. No administrator rights needed.
 that, opening a tab is all it takes; `workspace_status` says whether both halves
 are in place.
 
-## What the 48 tools cover
+## What the 50 tools cover
 
 | Group | What it is for |
 |---|---|
@@ -112,6 +122,7 @@ are in place.
 | **Logs** | ComfyUI's own console, and the browser console - where a failed extension is the only place it says anything |
 | **Canvas: reading** | the live graph, a screenshot of it, which workflow tabs are open, a diagnosis of what is wrong with it |
 | **Canvas: editing** | widget values, properties, on-screen labels, links, node modes, layout, groups, undo |
+| **Asking the user** | put a question on the ComfyUI screen and wait for the person to answer |
 | **Running** | run a file or the canvas, follow the progress, fetch the result, show an image |
 | **Downloading models** | fetch a model to the directory ComfyUI actually reads, with progress |
 | **Process and tab** | start, stop or restart ComfyUI; reload the browser tab |

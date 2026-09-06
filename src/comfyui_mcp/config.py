@@ -64,6 +64,19 @@ class Config:
     # "ask the machine" rather than "English".
     lang: str
 
+    # the Python environment ComfyUI runs on. Both empty by default: the interpreter
+    # and uv are found, and the finding is confirmed against the running instance
+    # rather than trusted. These are the escape hatch for a layout the search does not
+    # know - a conda environment, a venv outside the install.
+    python_exe: str
+    uv_exe: str
+
+    # checkpoints of that environment
+    checkpoint_dir: Path | None
+    checkpoint_keep: int
+    package_timeout: float
+    audit_timeout: float
+
     # downloading models
     download_token: str
     download_retries: int
@@ -144,6 +157,18 @@ def _str(name: str, default: str) -> str:
 def _path(name: str, default: Path) -> Path:
     raw = os.environ.get(name)
     return Path(raw).expanduser() if raw else default
+
+
+def _opt_path(name: str) -> Path | None:
+    """A path setting whose default is not a path but "work it out".
+
+    Unlike `_path`, there is no default to fall back to: where checkpoints go depends on
+    where ComfyUI is, and that is not known here. None means "derive it", which
+    `packages.checkpoints_dir` does - keeping the derivation beside the thing that
+    understands the layout rather than in a default expression here.
+    """
+    raw = os.environ.get(name)
+    return Path(raw).expanduser() if raw else None
 
 
 def _num(name: str, default: float, cast: type) -> float:
@@ -263,6 +288,12 @@ def load_config() -> Config:
         http_password=_str("COMFYUI_PASSWORD", ""),
         tools=_str("COMFYUI_TOOLS", "all"),
         lang=_str("COMFYUI_LANG", ""),
+        python_exe=_str("COMFYUI_PYTHON", ""),
+        uv_exe=_str("COMFYUI_UV", ""),
+        checkpoint_dir=_opt_path("COMFYUI_CHECKPOINT_DIR"),
+        checkpoint_keep=_int("COMFYUI_CHECKPOINT_KEEP", 5),
+        package_timeout=_float("COMFYUI_PACKAGE_TIMEOUT", 900),
+        audit_timeout=_float("COMFYUI_AUDIT_TIMEOUT", 300),
         download_token=_str("COMFYUI_DOWNLOAD_TOKEN", ""),
         download_retries=_int("COMFYUI_DOWNLOAD_RETRIES", 5),
         download_allow_hosts=_str("COMFYUI_DOWNLOAD_ALLOW_HOSTS", DEFAULT_DOWNLOAD_HOSTS),

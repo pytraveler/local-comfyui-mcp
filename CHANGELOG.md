@@ -8,6 +8,98 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
+## 0.1.8 - 07.09.2026
+
+### Added
+
+- **The Python environment: seven tools that make installing something a decision
+  rather than an accident.** The first half of a concept that continues in
+  extensions; what is here is reading, planning, auditing and undoing.
+
+  **The reason it exists is that a caller with no tool for a job does not stop
+  wanting the job done** - it reaches for the shell, where nothing knows what a
+  ComfyUI install is. This is `download_model`'s argument one layer down: the
+  narrowest point of the chain running from a node pack's `requirements.txt` to
+  `pip install` on somebody's machine.
+
+  **`plan_packages` says what an install would change, and refuses when the answer
+  is torch.** Measured on the install this was built against: asking for
+  `torchvision==0.25.0` - an ordinary pin out of a pack's requirements - plans to
+  replace `torch 2.11.0+cu130` with `torch 2.10.0`, the build with no CUDA. Nothing
+  in the request mentions torch, nothing in the output is an error, and the install
+  would succeed. Refused rather than warned about, because the cost of being wrong
+  is a multi-gigabyte download and a machine that has stopped using its GPU.
+
+  **`create_checkpoint` and `restore_checkpoint` are the undo.** A checkpoint is
+  text files - every `name==version`, what is in custom_nodes and at which commit,
+  which PyTorch index this install came from - so it costs kilobytes and needs no
+  disk-space check. Models, inputs, outputs and the contents of custom_nodes are
+  never copied; it records what was installed, not the files.
+
+  The list is captured as `uv pip list --format=freeze`, never `uv pip freeze`: the
+  latter reports a wheel install as `name @ file:///D:/a/ComfyUI/...`, the path on
+  the runner that built the portable archive - 80 of 286 packages here - and a
+  checkpoint written that way cannot be restored on any machine.
+
+  **Restoring writes a checkpoint of the current state first** and names it in the
+  reply, which is `load_workspace`'s guard: the tool cannot ask whether it is about
+  to destroy something, so it makes the answer not matter. It is refused while
+  ComfyUI is running, because that process holds the DLLs being replaced. Two
+  strengths - the default puts the recorded versions back and leaves everything else
+  alone, `exact=True` also uninstalls what is not on the list and names by name what
+  it cannot put back before it starts. `sageattention` and `sageattn3` on this
+  machine were compiled locally and are on no index at all.
+
+  Two things about restoring were learned from the first one run against a real
+  install rather than a test fixture. It installs with `--no-deps`, because a real
+  ComfyUI environment is routinely not resolvable as a whole - packs install their
+  requirements one at a time and pip lets a later one break an earlier one's
+  constraint in silence, so uv refuses the recorded set as unsatisfiable and the
+  restore does nothing. And the exact form carries the packaging tools explicitly:
+  omitting pip and setuptools tells `install` to leave them alone but tells `sync` to
+  delete them, which it duly planned to do.
+
+  **The interpreter is confirmed against the running ComfyUI, not merely found.** A
+  portable root routinely holds more than one python, and a package installed into
+  the wrong one is a silent no-op: uv reports success, the import still fails, and
+  the wrong conclusion is easy. `sys.version` from `/system_stats` is compared
+  whole. A restore cannot use that, ComfyUI having to be stopped for one, so it
+  checks the checkpoint's own recorded version instead.
+
+  **`audit_packages` runs pip-audit through `uv tool run`**, so nothing is added to
+  this project's dependencies - the same principle as the vendored `uv.exe`.
+  Measured: 118 advisories across 19 of 286 packages, which makes a non-empty answer
+  the normal state of a ComfyUI environment rather than an emergency. There is no
+  `--fix` and there will not be one.
+
+  It reads the installed distributions by path rather than resolving a requirements
+  file, because a ComfyUI environment routinely holds packages that are on no index -
+  `cstr`, installed from a git URL by was-node-suite, failed an entire audit by
+  itself. The advisories come from OSV rather than PyPI's own service: broader
+  coverage, and a different host, so the audit still answers when PyPI is what is
+  down.
+
+  **`describe_environment` reads three sources because no one of them is the
+  answer.** The disk says what is installed in custom_nodes, `/object_info` says
+  what registered, and `get_comfy_log` says why a pack did neither - a disabled pack
+  and a pack whose import died are both simply absent from ComfyUI's own view.
+  Measured here: 38 packs, two of them disabled and therefore invisible. Both of
+  ComfyUI-Manager's disabled spellings are recognised, because a pack this server
+  calls installed while Manager's UI calls it disabled is a disagreement the user
+  experiences as a node that is present and does not work.
+
+  Two new tool groups in `configure.bat`, both on by default. Switching the
+  checkpoints off makes the rest less safe rather than more, which is what the
+  warning beside it says.
+
+### Configuration
+
+- `COMFYUI_PYTHON` and `COMFYUI_UV` - the escape hatch for a layout the search does
+  not know. Both empty by default and both found automatically.
+- `COMFYUI_CHECKPOINT_DIR` - empty means `<COMFYUI_ROOT>/mcp_checkpoints`, beside
+  the install it describes rather than inside this checkout.
+- `COMFYUI_CHECKPOINT_KEEP`, `COMFYUI_PACKAGE_TIMEOUT`, `COMFYUI_AUDIT_TIMEOUT`.
+
 ## 0.1.7 - 2026-08-24
 
 ### Added

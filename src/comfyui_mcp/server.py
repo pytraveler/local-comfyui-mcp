@@ -22,9 +22,11 @@ import httpx
 
 from . import __version__
 from . import download as D
+from . import env as E
 from . import graph as G
 from . import i18n
 from . import logs as L
+from . import packages as P
 from . import store
 from . import toolsets as T
 from .bridge import BridgeClient, WorkspaceError, WorkspaceUnavailable
@@ -3566,6 +3568,552 @@ async def _shutdown() -> None:
     except Exception:  # noqa: BLE001 - a launcher can fail in any way on the way out
         log.warning("could not stop the ComfyUI this server started", exc_info=True)
     await CLIENT.aclose()
+
+
+@dataclass
+class Environment:
+    """The interpreter this server may write into, and how sure it is.
+
+    Assembled per call rather than cached: `COMFYUI_PYTHON` can be edited in `.env` and
+    a settings window can rewrite it, and an interpreter cached at import would then be
+    the one from before - which is a stale answer to the one question where a stale
+    answer means writing packages somewhere nobody is looking.
+    """
+
+    uv: Path
+    python: Path
+    how: str
+    version: str = ""
+    reported: str = ""
+    confirmed: bool = False
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "python": str(self.python),
+            "found_by": self.how,
+            "python_version": self.version.splitlines()[0] if self.version else "",
+            "uv": str(self.uv),
+            "confirmed_against_running_comfyui": self.confirmed,
+        }
+        if self.note:
+            out["note"] = self.note
+        return out
+
+
+async def _environment(require_confirmation: bool = False) -> Environment:
+    """Find uv and ComfyUI's interpreter, and confirm the second against ComfyUI itself.
+
+    **Found is not confirmed.** A portable root routinely holds more than one python -
+    the build's own, an `update/` folder, a venv somebody made once - and a package
+    installed into the wrong one is a silent no-op: uv reports success, the import still
+    fails, and the next thing the caller does is conclude the package was wrong. So the
+    candidate is asked for its `sys.version` and the answer compared with the
+    `python_version` the running ComfyUI reports for itself.
+
+    Confirmation needs a running ComfyUI and therefore cannot always be had. That is a
+    reported state rather than a failure, because reading an environment while ComfyUI
+    is down is an ordinary thing to want - it is half of why somebody would be looking.
+    `require_confirmation` is for the callers where being wrong writes something.
+    """
+    try:
+        uv = P.find_uv(CFG)
+        python, how = P.find_python(CFG)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    env = Environment(uv=uv, python=python, how=how)
+    env.version = await P.Uv(uv, python, 60).version()
+    if not env.version:
+        raise ComfyError(
+            f"{python} did not answer when asked for its version, so it is not an "
+            "interpreter this server can install into. Set COMFYUI_PYTHON."
+        )
+
+    if await CLIENT.is_alive():
+        stats = await CLIENT.system_stats()
+        env.reported = str(stats.get("system", {}).get("python_version", ""))
+        problem = E.python_mismatch(env.version, env.reported) if env.reported else ""
+        if problem:
+            raise ComfyError(
+                f"refusing to touch {python}: {problem} Candidates found here: "
+                + ", ".join(str(p) for p in P.python_candidates(CFG))
+            )
+        env.confirmed = bool(env.reported)
+    else:
+        env.note = (
+            "ComfyUI is not answering, so the interpreter could not be confirmed against "
+            "the process that actually serves. Reading is unaffected; anything that writes "
+            "packages checks the checkpoint's own record instead."
+        )
+        if require_confirmation:
+            raise ComfyError(
+                f"ComfyUI is not answering on {CFG.base_url}, so this server cannot confirm "
+                f"that {python} is the interpreter ComfyUI runs on. Start it with comfy_start "
+                "and call again, or set COMFYUI_PYTHON if you are sure."
+            )
+    return env
+
+
+async def _comfyui_version() -> str:
+    """ComfyUI's version, from the running instance or from its own source file.
+
+    The running instance first, by the rule the rest of this server follows. The file is
+    the fallback rather than the answer because a checkpoint is routinely taken with
+    ComfyUI stopped - which is exactly when it is safest to change anything.
+    """
+    if await CLIENT.is_alive():
+        try:
+            stats = await CLIENT.system_stats()
+            version = str(stats.get("system", {}).get("comfyui_version", ""))
+            if version:
+                return version
+        except (ComfyError, httpx.HTTPError, OSError):
+            pass
+    source = CFG.comfy_dir / "comfyui_version.py"
+    if source.is_file():
+        match = re.search(
+            r'__version__\s*=\s*["\']([^"\']+)', source.read_text(encoding="utf-8", errors="replace")
+        )
+        if match:
+            return match.group(1)
+    return ""
+
+
+@tool("env", "reads")
+async def describe_environment(packages: bool = False) -> dict[str, Any]:
+    """Report ComfyUI's Python environment: interpreter, packages, node packs, checkpoints.
+
+    The starting point for anything to do with installing. Three sources are read and
+    they answer different questions, which is why none of them is enough alone: the
+    disk says what is *installed* in custom_nodes, ComfyUI's `/object_info` says what
+    *registered*, and `get_comfy_log` says why a pack did neither. A disabled pack and a
+    pack whose import died are both simply absent from `/object_info`.
+
+    `pinned` is the set whose version is decided by which CUDA build this install has.
+    Nothing here will move one, and `plan_packages` refuses a plan that would.
+
+    Args:
+        packages: include the full `name==version` listing. It is long - 286 lines on
+            the install this was written against - so it is off by default and the
+            counts plus `pinned` are what a caller normally needs.
+    """
+    env = await _environment()
+    uv = P.Uv(env.uv, env.python, CFG.package_timeout)
+    try:
+        pins = await uv.freeze()
+        packs = P.read_packs(CFG)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    registered: set[str] = set()
+    object_info_note = ""
+    if await CLIENT.is_alive():
+        try:
+            registered = set(await _all_schemas())
+        except (ComfyError, httpx.HTTPError, OSError):
+            object_info_note = "ComfyUI answered but /object_info could not be read"
+    else:
+        object_info_note = (
+            "ComfyUI is not running, so nothing says which of these packs actually "
+            "register their nodes"
+        )
+
+    disabled = [p.name for p in packs if not p.enabled]
+    unrestorable = E.unrestorable(pins)
+    checkpoints = P.load_all(CFG)
+
+    out: dict[str, Any] = {
+        "environment": env.as_dict(),
+        "comfyui_version": await _comfyui_version(),
+        "packages_installed": len(pins),
+        "pinned": [p.line for p in pins if p.name in E.PINNED_FAMILY],
+        "unrestorable": [p.line for p in unrestorable],
+        "torch_index": E.torch_index_url(pins),
+        "custom_nodes": {
+            "installed": len(packs),
+            "disabled": disabled,
+            "with_registry_id": sum(1 for p in packs if p.registry_id),
+            "packs": [p.as_dict() for p in packs],
+        },
+        "checkpoints": {
+            "directory": str(P.checkpoints_dir(CFG)),
+            "count": len(checkpoints),
+            "latest": checkpoints[0].as_dict() if checkpoints else None,
+        },
+    }
+    if unrestorable:
+        out["hint"] = (
+            "The packages under `unrestorable` carry a local version segment, which means "
+            "that exact build exists on no ordinary index. Nothing here will replace one, "
+            "and a full restore names them before it starts."
+        )
+    if object_info_note:
+        out["object_info"] = object_info_note
+    elif registered:
+        out["node_types_registered"] = len(registered)
+    if packages:
+        out["packages"] = [p.line for p in pins]
+    return out
+
+
+@tool("env", "reads")
+async def plan_packages(requirements: list[str], upgrade: bool = False) -> dict[str, Any]:
+    """Say what installing these requirements would change - and refuse if it is unsafe.
+
+    Nothing is written and nothing is downloaded. This is the tool that answers the
+    question that caused all of this to exist, and the answer is worth reading in full
+    before any install: on the install this was built against, asking for
+    `torchvision==0.25.0` - an ordinary pin out of a node pack's requirements.txt -
+    plans to replace `torch 2.11.0+cu130` with `torch 2.10.0`, the build with no CUDA.
+    Nothing in that request mentions torch and nothing in the output is an error.
+
+    `refused` is set when the plan touches a package whose version belongs to the CUDA
+    build rather than to any requirement. That is a refusal rather than a warning
+    because the cost of being wrong is a gigabytes-long download and a machine whose
+    GPU has stopped being used, and because there is a right way to do it anyway: pin
+    the requirement so it accepts the torch that is already here.
+
+    Args:
+        requirements: pip requirement strings, e.g. `["insightface", "onnxruntime>=1.17"]`.
+        upgrade: also move packages that are already satisfied. Off by default, which is
+            what makes installing a node pack's requirements leave the rest alone.
+    """
+    if not requirements:
+        raise ComfyError("plan_packages needs at least one requirement to plan.")
+
+    env = await _environment()
+    try:
+        pins = await P.Uv(env.uv, env.python, CFG.package_timeout).freeze()
+        uv = P.Uv(env.uv, env.python, CFG.package_timeout, E.torch_index_url(pins))
+        plan = await uv.dry_run(requirements, upgrade=upgrade)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    risks = E.plan_risks(plan, pins)
+    out: dict[str, Any] = {
+        "requirements": list(requirements),
+        "environment": env.as_dict(),
+        "plan": plan.as_dict(),
+        "additive_only": E.plan_is_additive(plan),
+        "refused": bool(risks),
+        "risks": [{"package": r.name, "rule": r.rule, "detail": r.detail} for r in risks],
+    }
+    if plan.no_changes:
+        out["hint"] = "Everything asked for is already installed at a satisfying version."
+    elif risks:
+        out["hint"] = (
+            "This would move a package whose version belongs to this install's CUDA build. "
+            "Pin the requirement to a version compatible with the torch already here, or "
+            "install the pack without its pin and let it use what is present. If it really "
+            "must move, that is a decision for a person at a terminal, not for a tool call."
+        )
+    elif out["additive_only"]:
+        out["hint"] = "Additive only: every listed package is new, nothing installed moves."
+    return out
+
+
+@tool("env", "reads")
+async def audit_packages(limit: int = 40) -> dict[str, Any]:
+    """Check the installed packages against the published vulnerability advisories.
+
+    Runs pip-audit over the distributions installed in ComfyUI's interpreter, against
+    the OSV database. Measured on the install this was written against: 118 advisories
+    across 19 of 286 packages - so a non-empty answer is the normal state of a ComfyUI
+    environment rather than an emergency, and the useful reading is which of them are
+    reachable from what you actually run.
+
+    **Nothing is fixed here, and there is no flag that would.** `pip-audit --fix`
+    resolves and installs, which is exactly the unattended upgrade this whole concept
+    exists to stop. Take a finding to `plan_packages` first: rows flagged `pinned` cannot
+    be moved by this server at all, because their version belongs to the CUDA build.
+
+    pip-audit is fetched on demand by uv rather than being a dependency of this server,
+    so the first call needs network access and takes longer than the rest. The advisories
+    come from api.osv.dev, which is a different host from PyPI - the audit still answers
+    when PyPI is the thing that is down, provided the tool itself is already cached.
+
+    Args:
+        limit: how many affected packages to list, worst first.
+    """
+    env = await _environment()
+    uv = P.Uv(env.uv, env.python, CFG.package_timeout)
+    try:
+        pins = await uv.freeze()
+        raw = await P.audit(env.uv, env.python, CFG.audit_timeout, _scratch())
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    report = P.summarise_audit(raw, pins)
+    rows = report["vulnerable"]
+    out: dict[str, Any] = {
+        "environment": env.as_dict(),
+        "packages_audited": report["packages_audited"],
+        "packages_affected": report["packages_affected"],
+        "vulnerable": rows[: max(1, limit)],
+    }
+    if len(rows) > limit:
+        out["truncated"] = f"{len(rows) - limit} more, worst first; raise limit to see them"
+    if not rows:
+        out["hint"] = "Nothing on the advisory lists. This is uncommon and worth not assuming."
+    else:
+        out["hint"] = (
+            "A finding is not by itself a reason to upgrade: check what the package is "
+            "reachable from first, then ask plan_packages what moving it would cost. Rows "
+            "marked `pinned` will be refused."
+        )
+    return out
+
+
+@tool("checkpoints", "writes")
+async def create_checkpoint(note: str = "") -> dict[str, Any]:
+    """Record what is installed, so a later change to the environment can be undone.
+
+    Writes a folder of text files - the `name==version` of every package, what is in
+    custom_nodes and at which commit, and which PyTorch index this install came from.
+    Kilobytes, not gigabytes: models, inputs, outputs and the contents of custom_nodes
+    are not copied. It records what was installed, not the files themselves.
+
+    The recorded list is deliberately `uv pip list --format=freeze` rather than
+    `uv pip freeze`. The latter reports a wheel install as
+    `name @ file:///D:/a/ComfyUI/...`, the path on the runner that built the portable
+    archive - measured on 80 of 286 packages here - and a checkpoint written that way
+    cannot be restored on any machine.
+
+    Args:
+        note: why this one was taken. Shown in the listing; a checkpoint with no note is
+            hard to tell from the four beside it a month later.
+    """
+    env = await _environment()
+    uv = P.Uv(env.uv, env.python, CFG.package_timeout)
+    try:
+        pins = await uv.freeze()
+        packs = P.read_packs(CFG)
+        checkpoint = P.write(
+            CFG,
+            pins,
+            packs,
+            note=note.strip(),
+            comfyui_version=await _comfyui_version(),
+            python_version=env.version,
+            python_path=str(env.python),
+        )
+        pruned = P.prune(CFG, CFG.checkpoint_keep)
+    except (P.PackageError, OSError) as exc:
+        raise ComfyError(f"could not write a checkpoint: {exc}") from exc
+
+    out: dict[str, Any] = {
+        "checkpoint": checkpoint.as_dict(),
+        "path": str(checkpoint.path),
+        "not_backed_up": P.NOT_BACKED_UP,
+        "confirmed_interpreter": env.confirmed,
+    }
+    if pruned:
+        out["pruned"] = pruned
+        out["pruned_note"] = f"COMFYUI_CHECKPOINT_KEEP is {CFG.checkpoint_keep}"
+    if not env.confirmed:
+        out["warning"] = (
+            "ComfyUI was not answering, so the interpreter recorded here was found on disk "
+            "rather than confirmed against the running process. The restore checks the "
+            "recording against itself, which is unaffected."
+        )
+    return out
+
+
+@tool("checkpoints", "reads")
+async def list_checkpoints() -> dict[str, Any]:
+    """List the recorded environment states, newest first."""
+    every = P.load_all(CFG)
+    return {
+        "directory": str(P.checkpoints_dir(CFG)),
+        "keep": CFG.checkpoint_keep,
+        "checkpoints": [c.as_dict() for c in every],
+        "hint": (
+            "restore_checkpoint takes a name or an unambiguous prefix of one."
+            if every
+            else "None yet. create_checkpoint writes one, and it costs kilobytes."
+        ),
+    }
+
+
+@tool("checkpoints", "writes")
+async def restore_checkpoint(
+    name: str,
+    exact: bool = False,
+    allow_removing: list[str] | None = None,
+) -> dict[str, Any]:
+    """Put a recorded set of package versions back. Takes a checkpoint of the current state first.
+
+    The undo for everything that installs. Two strengths, and the difference is what
+    happens to packages that appeared since:
+
+    * default - install the recorded versions and leave anything else alone. This is
+      what undoes a bad upgrade, and it is safe because it only ever puts things back.
+    * `exact=True` - also uninstall whatever is not on the recorded list. A true
+      rollback, and the one that can lose work: everything it removes was installed
+      after the checkpoint, which is usually a node pack's dependency and occasionally
+      something that took an hour to compile. It is refused when the removal set holds a
+      build no index can supply, and `allow_removing` is how a caller says it means it.
+
+    **Not undoable, so a checkpoint of the current state is written first** and named in
+    the reply - the same guard `load_workspace` uses, and for the same reason: the tool
+    cannot ask whether it is about to destroy something, so it makes sure the answer
+    does not matter.
+
+    **Refused while ComfyUI is running.** Its interpreter holds the DLLs being replaced,
+    and half-replaced packages under a live process is how an install stops starting.
+    Call comfy_stop first.
+
+    Args:
+        name: a checkpoint name from list_checkpoints, or an unambiguous prefix.
+        exact: also remove packages that are not in the checkpoint.
+        allow_removing: package names this call is permitted to remove even though
+            nothing could install them back. Only meaningful with `exact`.
+    """
+    if await CLIENT.is_alive():
+        raise ComfyError(
+            f"ComfyUI is answering on {CFG.base_url}, and restoring packages under a running "
+            "process leaves it serving half-replaced code. Call comfy_stop (or close it), "
+            "then call this again."
+        )
+
+    try:
+        checkpoint = P.find(CFG, name)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    recorded = E.restorable(checkpoint.pins())
+    if not recorded:
+        raise ComfyError(
+            f"{checkpoint.name} records no restorable packages. Its packages.txt is missing "
+            "or empty, which means it was written by a failed run - delete it and take a new one."
+        )
+
+    python = Path(str(checkpoint.manifest.get("python", "")))
+    if not python.is_file():
+        env = await _environment()
+        python = env.python
+    try:
+        uv_exe = P.find_uv(CFG)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+    live_version = await P.Uv(uv_exe, python, 60).version()
+    recorded_version = str(checkpoint.manifest.get("python_version", ""))
+    if recorded_version:
+        problem = E.python_mismatch(live_version, recorded_version)
+        if problem:
+            raise ComfyError(f"refusing to restore into {python}: {problem}")
+
+    uv = P.Uv(uv_exe, python, CFG.package_timeout, str(checkpoint.manifest.get("torch_index", "")))
+    listing = _scratch() / f"restore-{checkpoint.name}.txt"
+    listing.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        before = await uv.freeze()
+
+        wanted = E.sync_list(recorded, before) if exact else recorded
+        listing.write_text(E.format_freeze(wanted), encoding="utf-8")
+
+        if exact:
+            preview = await uv.sync(listing, dry_run=True)
+            plan = E.parse_plan(preview.out)
+            if not preview.ok and not plan.moves:
+                raise ComfyError(
+                    "could not work out what an exact restore would remove, so it was not "
+                    f"attempted:\n{preview.out.strip()[:2000]}"
+                )
+            losses = E.removal_losses(plan, before)
+            permitted = {E.normalise(n) for n in (allow_removing or [])}
+            blocked = [p for p in losses if p.name not in permitted]
+            if blocked:
+                return {
+                    "restored": False,
+                    "checkpoint": checkpoint.as_dict(),
+                    "refused": True,
+                    "would_remove": [m.name for m in plan.removals],
+                    "unrecoverable": [p.line for p in blocked],
+                    "hint": (
+                        "These carry a build no ordinary index can supply, so removing them is "
+                        "not something a later install undoes. Pass their names in "
+                        "allow_removing if that is genuinely the intent, or leave exact=False, "
+                        "which puts the recorded versions back without removing anything."
+                    ),
+                }
+
+        safety = P.write(
+            CFG,
+            before,
+            P.read_packs(CFG),
+            note=f"automatic, before restoring {checkpoint.name}",
+            comfyui_version=await _comfyui_version(),
+            python_version=live_version,
+            python_path=str(python),
+        )
+
+        result = await uv.install_file(listing, exact=exact)
+        after = await uv.freeze()
+    except (P.PackageError, OSError) as exc:
+        raise ComfyError(str(exc)) from exc
+    finally:
+        listing.unlink(missing_ok=True)
+
+    changed = E.diff(before, after)
+    out: dict[str, Any] = {
+        "restored": result.ok,
+        "exact": exact,
+        "checkpoint": checkpoint.as_dict(),
+        "backup_of_previous_state": safety.name,
+        "changed": changed.as_dict(),
+        "seconds": round(result.seconds, 1),
+    }
+    if not result.ok:
+        out["error"] = result.out.strip()[-4000:]
+        out["hint"] = (
+            f"The restore did not finish. The state before it is recorded as {safety.name}, "
+            "so nothing is lost that was not already changed."
+        )
+    else:
+        extra = [p.name for p in E.installed_since(recorded, before)]
+        if changed.empty and extra and not exact:
+            out["extra_still_installed"] = extra[:40]
+            out["hint"] = (
+                f"The recorded versions were already in place, so nothing moved - but "
+                f"{len(extra)} package(s) installed since the checkpoint are still here. "
+                "exact=True is what removes those, and it names what it would take away first."
+            )
+        elif changed.empty:
+            out["hint"] = "The environment already matched the checkpoint; nothing moved."
+        else:
+            out["hint"] = "ComfyUI has to be started again for this to take effect."
+    return out
+
+
+@tool("checkpoints", "writes")
+async def delete_checkpoint(name: str) -> dict[str, Any]:
+    """Delete one recorded environment state.
+
+    Args:
+        name: a checkpoint name from list_checkpoints, or an unambiguous prefix.
+    """
+    try:
+        checkpoint = P.find(CFG, name)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+    P.delete(checkpoint)
+    return {"deleted": checkpoint.name, "remaining": [c.name for c in P.load_all(CFG)]}
+
+
+def _scratch() -> Path:
+    """A directory for the short-lived files uv is handed. Beside the checkpoints.
+
+    Not the system temp directory: a requirements file naming 286 packages is written
+    there and read back by a child process, and some machines have a temp folder that an
+    antivirus watches or that a different user owns. Beside the checkpoints it is on the
+    volume the rest of this already writes to.
+    """
+    path = P.checkpoints_dir(CFG) / ".work"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def main() -> None:

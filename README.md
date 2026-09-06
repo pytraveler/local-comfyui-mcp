@@ -8,7 +8,7 @@
   <a href="https://github.com/pytraveler/local-comfyui-mcp/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/pytraveler/local-comfyui-mcp?display_name=tag"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/pytraveler/local-comfyui-mcp"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="50 tools" src="https://img.shields.io/badge/tools-50-2ea44f">
+  <img alt="50 tools" src="https://img.shields.io/badge/tools-57-2ea44f">
   <a href="https://modelcontextprotocol.io"><img alt="MCP server" src="https://img.shields.io/badge/MCP-server-6E4AFF"></a>
   <a href="https://github.com/comfyanonymous/ComfyUI"><img alt="Drives a local ComfyUI" src="https://img.shields.io/badge/ComfyUI-local-1B98E0"></a>
 </p>
@@ -113,7 +113,7 @@ copy to drift. No administrator rights needed.
 that, opening a tab is all it takes; `workspace_status` says whether both halves
 are in place.
 
-## What the 50 tools cover
+## What the 57 tools cover
 
 | Group | What it is for |
 |---|---|
@@ -125,6 +125,8 @@ are in place.
 | **Asking the user** | put a question on the ComfyUI screen and wait for the person to answer |
 | **Running** | run a file or the canvas, follow the progress, fetch the result, show an image |
 | **Downloading models** | fetch a model to the directory ComfyUI actually reads, with progress |
+| **Environment: reading** | what is installed in ComfyUI's Python and in custom_nodes, which packages have known vulnerabilities, and what an install would change before it changes it |
+| **Environment: checkpoints** | record what is installed, and put a recorded state back |
 | **Process and tab** | start, stop or restart ComfyUI; reload the browser tab |
 
 A ComfyUI **this server started** is stopped when the server exits, and stopping

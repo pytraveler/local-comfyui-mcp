@@ -10,7 +10,7 @@ then lies about itself.
 
 Three reasons this exists, and only the last is about safety:
 
-*Context.* All 50 schemas reach the model at the start of every session. Somebody
+*Context.* All 57 schemas reach the model at the start of every session. Somebody
 who only ever runs workflow files pays for twenty canvas tools they never call.
 
 *The decision is made when nobody is in a hurry.* A permission prompt raised in
@@ -237,6 +237,55 @@ GROUPS: tuple[Group, ...] = (
         ),
     ),
     Group(
+        name="env",
+        title=Text(en="Environment: reading", ru="Окружение: чтение"),
+        risk="reads",
+        summary=Text(
+            en=(
+                "What is installed in ComfyUI's Python environment and in custom_nodes, "
+                "which packages have known vulnerabilities, and what an install would change."
+            ),
+            ru=(
+                "Что установлено в python-окружении ComfyUI и в custom_nodes, у каких пакетов "
+                "есть известные уязвимости и что изменила бы установка."
+            ),
+        ),
+        warning=Text(
+            en=(
+                "Read-only, and the reason the rest of this exists: a caller that can see "
+                "torch 2.11.0+cu130 becoming 2.10.0 in a plan does not have to be talked out "
+                "of running pip. The audit fetches advisories, so it needs the network."
+            ),
+            ru=(
+                "Только чтение, и ради этого всё остальное и сделано: тому, кто видит в плане "
+                "torch 2.11.0+cu130 -> 2.10.0, не нужно объяснять, почему не надо звать pip. "
+                "Аудит тянет базу уязвимостей, поэтому ему нужна сеть."
+            ),
+        ),
+    ),
+    Group(
+        name="checkpoints",
+        title=Text(en="Environment: checkpoints", ru="Окружение: чекпойнты"),
+        risk="writes",
+        summary=Text(
+            en="Recording what is installed, and putting a recorded state back.",
+            ru="Запись того, что установлено, и возврат записанного состояния.",
+        ),
+        warning=Text(
+            en=(
+                "This is the undo for everything that touches packages, so switching it off "
+                "makes the rest unsafe rather than safer. A checkpoint costs kilobytes and "
+                "records only what was installed - restoring one rewrites the environment and "
+                "cannot itself be undone."
+            ),
+            ru=(
+                "Это отмена для всего, что трогает пакеты, так что выключение делает остальное "
+                "не безопаснее, а опаснее. Чекпойнт весит килобайты и хранит только список "
+                "установленного; откат переписывает окружение, и его самого отменить нельзя."
+            ),
+        ),
+    ),
+    Group(
         name="process",
         title=Text(en="Process and tab", ru="Процесс и вкладка"),
         risk="process",
@@ -299,6 +348,28 @@ DEPENDS: tuple[tuple[str, tuple[str, ...], Text], ...] = (
         Text(
             en="replacing the canvas blind: what came out of it cannot be read",
             ru="замена холста вслепую: что получилось, не прочитать",
+        ),
+    ),
+    (
+        "audit_packages",
+        ("plan_packages",),
+        Text(
+            en=(
+                "vulnerabilities can be found but not costed: nothing says what upgrading one "
+                "would do to torch"
+            ),
+            ru=(
+                "уязвимости найдутся, но цену не узнать: нечем проверить, что обновление сделает "
+                "с torch"
+            ),
+        ),
+    ),
+    (
+        "restore_checkpoint",
+        ("create_checkpoint",),
+        Text(
+            en="a rollback with no way to record a state to roll back to",
+            ru="откат есть, а записать состояние, к которому откатываться, нечем",
         ),
     ),
 )

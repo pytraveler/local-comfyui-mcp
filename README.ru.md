@@ -8,7 +8,7 @@
   <a href="https://github.com/pytraveler/local-comfyui-mcp/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/pytraveler/local-comfyui-mcp?display_name=tag"></a>
   <a href="LICENSE"><img alt="Лицензия" src="https://img.shields.io/github/license/pytraveler/local-comfyui-mcp"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="50 инструментов" src="https://img.shields.io/badge/tools-50-2ea44f">
+  <img alt="50 инструментов" src="https://img.shields.io/badge/tools-57-2ea44f">
   <a href="https://modelcontextprotocol.io"><img alt="MCP-сервер" src="https://img.shields.io/badge/MCP-server-6E4AFF"></a>
   <a href="https://github.com/comfyanonymous/ComfyUI"><img alt="Управляет локальным ComfyUI" src="https://img.shields.io/badge/ComfyUI-local-1B98E0"></a>
 </p>
@@ -115,7 +115,7 @@ Junction (симлинк на Unix) в `custom_nodes`, так что второ�
 при старте. Дальше достаточно открыть вкладку; `workspace_status` скажет, обе ли
 половины на месте.
 
-## Что умеют 50 инструментов
+## Что умеют 57 инструментов
 
 | Группа | Для чего |
 |---|---|
@@ -127,6 +127,8 @@ Junction (симлинк на Unix) в `custom_nodes`, так что второ�
 | **Вопрос пользователю** | показать вопрос в окне ComfyUI и дождаться ответа человека |
 | **Запуск** | запустить файл или холст, следить за прогрессом, забрать результат, показать картинку |
 | **Загрузка моделей** | скачать модель в тот каталог, который ComfyUI действительно читает, с прогрессом |
+| **Окружение: чтение** | что установлено в python ComfyUI и в custom_nodes, у каких пакетов есть известные уязвимости и что изменила бы установка - до того, как изменит |
+| **Окружение: чекпойнты** | записать, что установлено, и вернуть записанное состояние |
 | **Процесс и вкладка** | запустить, остановить или перезапустить ComfyUI; перезагрузить вкладку |
 
 ComfyUI, запущенный **этим сервером**, гасится при выходе сервера, и гасится

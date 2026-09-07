@@ -367,6 +367,24 @@ def removal_losses(plan: Plan, installed: list[Pin]) -> list[Pin]:
     return out
 
 
+def disturbs_installed(plan: Plan) -> bool:
+    """Whether this plan touches a package that is already installed.
+
+    A different question from `plan_is_additive`, and the difference is a plan that
+    does nothing at all: `plan_is_additive` answers False for one, because no listed
+    package is new, while this answers False because nothing is being replaced. Asking
+    the first where the second belongs makes an install defer packages it was never
+    going to move - measured on a pack whose every requirement was already satisfied.
+
+    This is the one that decides whether an install is safe while ComfyUI is running.
+    A new package is written into site-packages beside the others and nothing has it
+    open; replacing one that is already there means overwriting a file a running
+    interpreter may hold, which on Windows fails outright and leaves the package half
+    written.
+    """
+    return bool(plan.changes or plan.removals)
+
+
 def plan_is_additive(plan: Plan) -> bool:
     """Whether this plan only adds packages. The common, uninteresting, safe case.
 
@@ -896,3 +914,223 @@ def registered_by(schemas: dict, pack: Pack) -> list[str]:
         if owner and normalise(owner) == want:
             found.append(str(name))
     return sorted(found)
+
+
+MANAGER_PACK = "comfyui-manager"
+MANAGER_CHANNEL = "default"
+MANAGER_MODE = "cache"
+SECURITY_LEVELS = ("weak", "normal-", "normal", "strong")
+
+
+def install_item(node_id: str, version: str, ui_id: str = "") -> dict:
+    """The body `/manager/queue/install` wants for a registry pack at a pinned version.
+
+    **`skip_post_install` is the seam this whole design rests on.** With it set,
+    Manager fetches the pack and places it - resolving the registry id, downloading
+    the archive, extracting it, writing the `.tracking` file that makes a later
+    uninstall exact - and then *drops the post-install step on the floor*: nothing
+    calls the returned closure anywhere in the HTTP path (only `cm-cli.py` does). That
+    step is two things this server is not willing to have happen behind its back:
+
+    - **it pip-installs `requirements.txt` one line at a time**, which is precisely the
+      mechanism that leaves a real ComfyUI environment unresolvable as a whole, and it
+      does so with no plan, no checkpoint and nothing watching torch;
+    - **it runs the pack's own `install.py`**, which is arbitrary code from the pack.
+
+    So Manager does the half it is good at and this server does the half it exists for.
+    The price is that a pack needing its `install.py` is not fully installed by this
+    route, which is reported rather than hidden.
+
+    `version` is what goes into `selected_version`; `"latest"` is the accepted way to
+    say "whatever is current". `version` must not be `"unknown"` on either key - that
+    spelling selects Manager's git-URL path, which is a different operation with a
+    different security rating.
+    """
+    chosen = version.strip() or "latest"
+    if chosen == "unknown":
+        raise ValueError("'unknown' is Manager's git-URL path, not a version")
+    return {
+        "id": node_id,
+        "ui_id": ui_id or node_id,
+        "version": chosen,
+        "selected_version": chosen,
+        "channel": MANAGER_CHANNEL,
+        "mode": MANAGER_MODE,
+        "skip_post_install": True,
+    }
+
+
+def security_refusal(level: str, loopback: bool = True) -> str:
+    """Why Manager will refuse to install at this security level, or "" if it will not.
+
+    Read from Manager's `config.ini` when it can be found, and used for the *message*
+    only - the authority is always Manager's own HTTP status, because the file can be
+    stale, moved by `--user-directory`, or overridden at startup by the migration that
+    forces `strong` on an old ComfyUI. Guessing generously here and being wrong costs a
+    clear refusal; guessing meanly costs an install that would have worked.
+    """
+    value = level.strip().lower()
+    if not value or value in ("weak", "normal", "normal-"):
+        return ""
+    return (
+        f"ComfyUI-Manager's security_level is {value!r}, and installing needs 'middle or "
+        "below' - which it grants to 'weak', 'normal' and 'normal-'. That setting is the "
+        "administrator's answer to whether this ComfyUI may install code at all, so this "
+        "server will not work around it. Change it in ComfyUI-Manager's own settings if "
+        "it is yours to change."
+    )
+
+
+def queue_outcome(event: dict, ui_id: str) -> tuple[bool, str]:
+    """Did our item succeed, out of Manager's one and only `done` event.
+
+    `nodepack_result` maps ui_id to the string `do_install` returned: `'success'`, or
+    the failure text. **It is broadcast exactly once and cleared in the same breath** -
+    `task_worker` assigns `nodepack_result = {}` immediately after sending - so there is
+    no second place to read it and polling cannot recover it. That is the whole reason
+    this path watches the socket instead of the queue counters.
+
+    An item missing from the map is not a success. It means the worker never reached
+    ours, which happens when somebody queues in the browser at the same time.
+    """
+    results = event.get("nodepack_result")
+    if not isinstance(results, dict):
+        return False, "Manager reported the queue finished without saying what happened."
+    if ui_id not in results:
+        others = ", ".join(sorted(str(k) for k in results)) or "nothing at all"
+        return False, (
+            f"Manager finished its queue without a result for {ui_id!r}; it reported on "
+            f"{others}. The queue is shared with ComfyUI's own Manager UI, so this is what "
+            "another install running at the same time looks like."
+        )
+    message = str(results[ui_id])
+    return message == "success", message
+
+
+def queue_is_busy(status: dict) -> bool:
+    """Whether somebody else's work is in Manager's queue right now.
+
+    Worth its own function because the "no" is indistinguishable from "finished": the
+    worker clears `nodepack_result` and lets its thread die, so a completed queue reports
+    `{total: 0, done: 0, in_progress: 0, is_processing: false}` - byte for byte what a
+    queue that never ran reports. Starting into somebody else's queue would hand us their
+    results and them ours.
+    """
+    if bool(status.get("is_processing")):
+        return True
+    return int(status.get("total_count") or 0) > int(status.get("done_count") or 0)
+
+
+_INLINE_COMMENT = re.compile(r"(^|\s)#")
+
+_OPTION = ("-",)
+
+
+def parse_requirements(text: str) -> tuple[list[str], list[str]]:
+    """Split a requirements.txt into what can be installed and what was set aside.
+
+    **The comment rule is pip's, not `split('#')`**, and the difference is not
+    cosmetic. pip treats `#` as starting a comment only at the beginning of a line or
+    after whitespace, because a `#` with no space before it is routinely part of a
+    direct reference - `pkg @ https://host/x.whl#sha256=...`. ComfyUI-Manager's own
+    installer does `package_name.split('#')[0]`, which truncates that to a URL with no
+    fragment and installs different bytes without saying so. Measured against Manager
+    3.40's `execute_install_script`.
+
+    Skipped lines are returned rather than dropped: `-r base.txt` and `--index-url`
+    change what an install means, and a caller told "12 requirements" when one of them
+    redirected the index has been told something false.
+    """
+    requirements: list[str] = []
+    skipped: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = _INLINE_COMMENT.search(line)
+        if match:
+            line = line[: match.start()].strip()
+        if not line:
+            continue
+        if line.startswith(_OPTION):
+            skipped.append(raw.strip())
+            continue
+        requirements.append(line)
+    return requirements, skipped
+
+
+CLONE_SCHEME = "https://"
+
+_SAFE_FOLDER = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def check_clone_url(url: str) -> str:
+    """Why this URL will not be cloned, or "" if it will be.
+
+    **`https://` and nothing else**, and the reason is narrower than a policy about
+    hosts. This string is handed to `git clone` as an argument, so a value beginning `-`
+    is an *option* rather than a URL - `--upload-pack=...` is the well-known shape - and
+    `file://`, a bare path and `git@host:path` all reach something that is not a fetch
+    over the network at all. Requiring the scheme settles every one of those with a
+    check that cannot be argued with, rather than with a list of spellings to refuse.
+
+    There is deliberately no allow-list of hosts here, the way `download_model` has one.
+    That check exists because a model URL routinely arrives from a document this server
+    read, so an injected instruction could name any host; a repository URL to be *looked
+    at* is a thing a person asked for, nothing from it is executed, and the report says
+    outright that installing it is a separate decision.
+    """
+    text = url.strip()
+    if not text:
+        return "there is no URL to clone."
+    if not text.lower().startswith(CLONE_SCHEME):
+        return (
+            f"{text!r} is not an https:// URL, and only those are cloned. A bare path, a "
+            "file:// URL and git@host:path all reach something other than a fetch over "
+            "the network, and a value beginning with '-' is an option to git rather than "
+            "a repository at all."
+        )
+    if any(c.isspace() for c in text):
+        return f"{text!r} contains whitespace, so it is not one URL."
+    return ""
+
+
+def repo_folder(url: str) -> str:
+    """The directory name a clone of this URL gets. Never a path, never empty.
+
+    Taken from the last segment and stripped of everything that is not a plain name, so
+    a URL cannot choose where the clone lands however it is spelled.
+    """
+    tail = url.strip().rstrip("/").rpartition("/")[2]
+    if tail.lower().endswith(".git"):
+        tail = tail[:-4]
+    cleaned = _SAFE_FOLDER.sub("-", tail).strip("-.")
+    return cleaned or "repository"
+
+
+RATING_INSTALLABLE = "middle"
+RATING_UNKNOWN_REPO = "high"
+RATING_UNKNOWN_PIP = "block"
+
+
+def manager_rating(known_urls: set, known_pip: set, files: list, pip: list) -> str:
+    """How ComfyUI-Manager would rate installing this repository - a prediction, not a verdict.
+
+    `get_risky_level` compares the repository URL against every `files` entry in its
+    node list and every `pip` entry beside them: an unknown repository is `high`, and a
+    known repository asking for a pip package the list has never seen is `block`, which
+    no security level permits. Reproduced here so the report can say *why* Manager would
+    refuse before it is asked, rather than turning its 404 into a guess.
+
+    It is a prediction because Manager merges a cached remote copy of that list with the
+    local one and only the local one is read here. So this can say `high` where Manager
+    would say `middle`; it cannot say `middle` where Manager would say `high`, which is
+    the safe direction for a sentence somebody reads before deciding.
+    """
+    for url in files:
+        if url not in known_urls:
+            return RATING_UNKNOWN_REPO
+    for package in pip:
+        if package not in known_pip:
+            return RATING_UNKNOWN_PIP
+    return RATING_INSTALLABLE

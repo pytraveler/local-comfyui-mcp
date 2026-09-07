@@ -688,6 +688,49 @@ def pack_location(cfg: Config, pack: E.Pack) -> Path | None:
     return None
 
 
+REQUIREMENTS_FILE = "requirements.txt"
+
+INSTALL_SCRIPT = "install.py"
+
+
+def pack_requirements(cfg: Config, pack: E.Pack) -> tuple[list[str], list[str]]:
+    """What a pack on disk asks for, and which of its lines were set aside.
+
+    Read *after* the pack is placed, and deliberately not instead of the registry's
+    copy. The registry answers before anything is fetched, which is what makes a plan
+    possible at all; the file is what the version that actually landed asks for, and
+    the two are allowed to differ - a pack published a year ago and installed today is
+    the ordinary case for that.
+
+    A pack with no `requirements.txt` is the common case rather than an error:
+    ComfyUI-Manager's installer skips the step entirely when the file is absent.
+    """
+    location = pack_location(cfg, pack)
+    if location is None or not location.is_dir():
+        return [], []
+    path = location / REQUIREMENTS_FILE
+    if not path.is_file():
+        return [], []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], []
+    return E.parse_requirements(text)
+
+
+def has_install_script(cfg: Config, pack: E.Pack) -> bool:
+    """Whether the pack ships an `install.py` that this server did not run.
+
+    ComfyUI-Manager's post-install step runs it, and this server asks Manager to skip
+    that step - so a pack carrying one is only partly installed here, and that has to
+    be reported rather than discovered later as a pack that does not work. It is
+    arbitrary code from the pack, executed at install time with no sandbox, which is
+    precisely the thing there is no safe way to run on somebody's behalf.
+    """
+    location = pack_location(cfg, pack)
+    return bool(location and (location / INSTALL_SCRIPT).is_file())
+
+
 def toggle_pack(cfg: Config, pack: E.Pack, enable: bool) -> tuple[Path, Path]:
     """Move a pack between enabled and disabled, and report where it went.
 
@@ -931,3 +974,61 @@ def prune(cfg: Config, keep: int) -> list[str]:
 
 def delete(checkpoint: Checkpoint) -> None:
     shutil.rmtree(checkpoint.path, ignore_errors=True)
+
+
+STAGING_DIR = ".staging"
+
+STAGING_IS_NOT_INSTALLED = (
+    "A staged clone is not installed and cannot be: it is outside custom_nodes, which is "
+    "the only place ComfyUI looks, so nothing here imports it, nothing runs its "
+    "install.py and no package has moved. It is a copy to read."
+)
+
+
+def staging_dir(cfg: Config) -> Path:
+    """Where a repository is cloned to be looked at - deliberately not custom_nodes.
+
+    Beside the checkpoints for `_scratch`'s reason: it is the volume this server already
+    writes to, chosen by the same setting, rather than a system temp folder that an
+    antivirus watches or another user owns. The name starts with a dot so that anything
+    walking custom_nodes-shaped trees passes it over, and it is nowhere near
+    custom_nodes anyway, which is the whole point.
+    """
+    path = checkpoints_dir(cfg) / STAGING_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def find_git(cfg: Config) -> Path | None:
+    """A git executable, or None - and None is an ordinary answer here.
+
+    `git_state` reads `.git` rather than shelling out precisely because a portable
+    ComfyUI unpacked from a zip has no git at all. Cloning cannot dodge it that way, so
+    the only honest thing is to look and to say so when there is nothing. ComfyUI-Manager
+    records its own `git_exe` when the user pointed it somewhere, and that answer is
+    better than PATH when both exist.
+    """
+    from . import manager as _manager
+
+    declared = _manager.read_settings(cfg).get("git_exe", "").strip()
+    if declared:
+        candidate = Path(declared)
+        if candidate.is_file():
+            return candidate
+    found = shutil.which("git")
+    return Path(found) if found else None
+
+
+async def clone(git: Path, url: str, dest: Path, ref: str, timeout: float) -> Run:
+    """One shallow clone into `dest`. Nothing else, and nothing is checked out twice.
+
+    `--depth 1` because this is for reading what a pack asks for, not for its history,
+    and the difference on a pack carrying model files is minutes. `--` ends the options
+    so the URL cannot become one, which the `https://` check already prevents and which
+    costs nothing to state twice.
+    """
+    argv: list[str | Path] = [git, "clone", "--depth", "1", "--single-branch"]
+    if ref.strip():
+        argv += ["--branch", ref.strip()]
+    argv += ["--", url, dest]
+    return await run(argv, timeout)

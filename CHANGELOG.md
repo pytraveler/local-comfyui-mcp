@@ -8,6 +8,138 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
+## 0.1.10 - 07.09.2026
+
+### Added
+
+- **Installing, which is the middle of the extension concept and was built last on
+  purpose.** Three tools - `install_extension`, `update_extension`,
+  `repair_extension` - in a group of their own, `extensions_install`.
+
+  **What installing a pack does to a machine is almost never its own files.** Those
+  are a folder that `set_extension_enabled` hides again in one rename. It is the
+  packages its requirements move, and that is the half with no undo - so the order
+  is the whole design: the plan is read before anything is fetched and an unsafe one
+  is refused outright, a checkpoint is written whether or not anybody asked for one,
+  and the difference is *measured* afterwards rather than reported from the plan a
+  second time.
+
+  **The fetching is ComfyUI-Manager's and the packages are this server's, and the
+  seam is one flag.** `skip_post_install` makes Manager resolve the registry id,
+  download the archive, extract it and write its `.tracking` file - and then drop
+  its post-install step, which nothing in its HTTP path ever calls. That step does
+  two things worth not having happen unwatched: it pip-installs `requirements.txt`
+  **one line at a time**, which is exactly the mechanism that leaves a real ComfyUI
+  environment unresolvable as a whole, and it runs the pack's own `install.py`,
+  which is arbitrary code. Reimplementing the fetch was never the alternative: a
+  second set of conventions for the same folders is how a pack ends up installed
+  twice under two names.
+
+  **Manager's own security setting still decides what may be installed, and nothing
+  here works around it.** Installing needs its `security_level` at middle-or-below;
+  anything it rates high - every git URL it does not already know, and every
+  `nightly` - needs `weak`. That setting is the administrator's answer to whether
+  this ComfyUI may install code at all, and a tool that routed around it would be
+  the thing this whole concept exists to prevent. No route exposes the level, so
+  Manager's `config.ini` is read from disk to word the refusal and Manager's own
+  HTTP status is always the authority.
+
+  **A pack lands whole; its packages are a separate decision and sometimes a later
+  one.** A plan that only adds packages is applied straight away - nothing already
+  imported is replaced. A plan that *moves* an installed version is not, because
+  replacing a file a running process holds open fails outright on Windows and leaves
+  the package half written. The pack is placed, the packages wait, and the reply
+  says to stop ComfyUI and call `repair_extension` - which needs neither
+  ComfyUI-Manager nor a running ComfyUI, and is therefore also the tool for a pack
+  whose import fails on a missing module.
+
+  **The requirements are read twice, from two sources, deliberately.** The
+  registry's copy answers before anything is fetched, which is what makes a refusal
+  possible at all; the `requirements.txt` that arrives with the pack is what the
+  version actually on disk asks for. They are allowed to disagree - a pack published
+  a year ago and installed today is the ordinary case - so both are planned, and a
+  pack that lands with an unsafe one is left inert rather than half-installed. Inert
+  is visible: its import fails, `describe_extension` reports zero registered types,
+  and no package has moved.
+
+  **A pack's `install.py` is never run**, and the reply says so when there is one.
+  Arbitrary code from the pack, at install time, with no sandbox: there is no safe
+  way to run it on somebody's behalf.
+
+  **There is no uninstall tool, and that is the ordering rather than an omission.**
+  `set_extension_enabled` is the reversible undo and costs one rename; deleting a
+  folder in `custom_nodes` is not reversible, and those folders are the user's -
+  the same reason a checkpoint never copies them. `restore_checkpoint` is what puts
+  packages back.
+
+- **`stage_extension` is the answer to "this pack is on GitHub and not published", and
+  it stops one step short of installing on purpose.** It clones the repository to a
+  staging directory that is *not* `custom_nodes` - the only place ComfyUI looks - so
+  nothing is imported, no `install.py` runs and no package moves. What comes back is
+  what a decision needs: what the pack says it is, what it would install, what that
+  would move in this environment, whether the same pack is already here under another
+  folder name, and how ComfyUI-Manager would rate it.
+
+  **The rating is Manager's own rule, reproduced.** `get_risky_level` compares the URL
+  against every repository in `custom-node-list.json` - 4783 of them on this machine -
+  and the requirements against the pip packages listed beside them: an unknown
+  repository is `high` and needs `security_level` `weak`, and a known repository asking
+  for a package the catalogue has never seen is `block`, which no level permits. Only
+  the local catalogue is read while Manager merges a fresher remote copy when it is
+  actually asked, so this is stricter than Manager and never looser - the safe
+  direction for a sentence somebody decides on.
+
+  **When Manager would refuse, the refusal stands, and there is no tool here that
+  proceeds anyway.** No git-URL installer was built, and that is the decision rather
+  than an unfinished piece: `security_level` is the administrator's answer to whether
+  this ComfyUI may install unvetted code, and routing around it is the exact shape of
+  the incident this whole concept exists to prevent. Going further is a command for a
+  person - and the staged clone is what that decision should be made on.
+
+  Only `https://` URLs are cloned. The value is an argument to `git clone`, so one
+  beginning `-` is an option rather than a repository (`--upload-pack=...` is the known
+  shape), and `file://`, a bare path and `git@host:path` all reach something that is not
+  a fetch over the network.
+
+- **`update_extension` goes back as readily as forward.** Manager's install route
+  sends an already-enabled pack at a different version to `cnr_switch_version`, so
+  one mechanism covers install, update and downgrade. "The update broke it" is
+  therefore a fixable sentence: name the version that worked.
+
+### Fixed
+
+- **The network diagnosis shipped in 0.1.9 was right about the shape and wrong in two
+  details, and a day later half of it had disappeared.** `pypi.org`'s 10.2 s is in the
+  **TCP connect**, not the TLS handshake - `time_connect` 10.15 s against
+  `time_appconnect` 10.21 s, so TLS itself costs 60 ms - which points at one of its four
+  A records rather than at anything cryptographic. And it is **intermittent**: measured
+  the next day, curl answered in 0.46 s, a uv resolve failed outright after 47.6 s, and
+  another resolved in 24.4 s minutes later. The interception of
+  `files.pythonhosted.org` was simply gone - a genuine GlobalSign certificate where AO
+  Kaspersky Lab's had been, so that half was somebody's antivirus setting rather than a
+  property of the network. Both are corrected in CLAUDE.md with both measurements kept,
+  because a check that concluded "PyPI is unreachable" from one failure would have been
+  wrong on both days in opposite directions. `COMFYUI_PACKAGE_INDEX` stays empty by
+  default for exactly that reason.
+
+- **A plan that changes nothing was being treated as a plan that changes
+  everything.** `plan_is_additive` answers False for a no-op plan - correctly, since
+  no listed package is new - and asking it the *other* question made an install
+  defer packages it was never going to move, and a repair refuse while ComfyUI ran
+  over a plan whose every requirement was already satisfied. Measured on
+  ComfyUI-KJNodes, whose five requirements are all present here.
+  `disturbs_installed` is the predicate that was actually wanted: does this plan
+  touch something already installed.
+
+- **A `#` in the middle of a requirement is not a comment, and this is the second
+  place that mattered.** `parse_requirements` follows pip's rule - a comment starts
+  at the beginning of a line or after whitespace - because a `#` with nothing before
+  it is routinely part of a direct reference (`pkg @ https://host/x.whl#sha256=...`).
+  ComfyUI-Manager's own installer does `split('#')[0]`, which truncates that to a
+  URL with no fragment and installs different bytes without saying so. Lines
+  beginning `-` are instructions to pip rather than requirements and are reported
+  rather than dropped: `--index-url` changes where every package comes from.
+
 ## 0.1.9 - 07.09.2026
 
 ### Added

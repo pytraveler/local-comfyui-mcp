@@ -8,7 +8,7 @@
   <a href="https://github.com/pytraveler/local-comfyui-mcp/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/pytraveler/local-comfyui-mcp?display_name=tag"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/pytraveler/local-comfyui-mcp"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
-  <img alt="60 tools" src="https://img.shields.io/badge/tools-60-2ea44f">
+  <img alt="64 tools" src="https://img.shields.io/badge/tools-64-2ea44f">
   <a href="https://modelcontextprotocol.io"><img alt="MCP server" src="https://img.shields.io/badge/MCP-server-6E4AFF"></a>
   <a href="https://github.com/comfyanonymous/ComfyUI"><img alt="Drives a local ComfyUI" src="https://img.shields.io/badge/ComfyUI-local-1B98E0"></a>
 </p>
@@ -113,7 +113,7 @@ copy to drift. No administrator rights needed.
 that, opening a tab is all it takes; `workspace_status` says whether both halves
 are in place.
 
-## What the 60 tools cover
+## What the 64 tools cover
 
 | Group | What it is for |
 |---|---|
@@ -129,6 +129,7 @@ are in place.
 | **Environment: checkpoints** | record what is installed, and put a recorded state back |
 | **Extensions: reading** | search the Comfy Registry, and report what one installed node pack is, where it came from and whether its nodes actually load |
 | **Extensions: enabling and disabling** | turn an installed node pack off and on again, the way ComfyUI-Manager does |
+| **Extensions: installing** | install a node pack from the Comfy Registry, move one to another released version, or install the requirements of one already on disk - each with the plan read and refused first, and a checkpoint written |
 | **Process and tab** | start, stop or restart ComfyUI; reload the browser tab |
 
 A ComfyUI **this server started** is stopped when the server exits, and stopping

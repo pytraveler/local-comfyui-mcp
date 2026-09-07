@@ -10,6 +10,7 @@ import json
 import logging
 import random
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ from . import i18n
 from . import logs as L
 from . import packages as P
 from . import registry as R
+from . import manager as M
 from . import store
 from . import toolsets as T
 from .bridge import BridgeClient, WorkspaceError, WorkspaceUnavailable
@@ -4293,10 +4295,13 @@ async def describe_extension(name: str) -> dict[str, Any]:
         out["node_types_not_shown"] = len(types) - E.NODE_TYPES_SHOWN
     if not types:
         out["hint"] = (
-            f"{pack.name} is installed and enabled and has registered no node types at all, "
-            "which means its import failed - ComfyUI catches that and carries on, so nothing "
-            "on the canvas says so and every workflow using it simply has holes. "
-            "get_comfy_log is where the traceback is."
+            f"{pack.name} is installed and enabled and has registered no node types at all. "
+            "Two things look like this and they need opposite next steps. If it was "
+            "installed or enabled since ComfyUI last started, it has simply never been "
+            "imported - ComfyUI reads custom_nodes once at startup - and restart_comfy is "
+            "the whole answer. Otherwise its import died: ComfyUI catches that and carries "
+            "on, so nothing on the canvas says so and every workflow using it has holes "
+            "where its nodes were, and get_comfy_log is where the traceback is."
         )
     return out
 
@@ -4346,6 +4351,770 @@ async def set_extension_enabled(name: str, enabled: bool) -> dict[str, Any]:
     }
     if not enabled:
         out["packages"] = P.DEPENDENCIES_STAY
+    return out
+
+
+async def _resolve_listing(name: str) -> E.Listing:
+    """The one registry entry a caller means, or a refusal naming the candidates.
+
+    `_resolve_pack`'s rule, applied to the registry instead of to the disk, and for the
+    same reason: installing the wrong pack looks exactly like installing the right one,
+    and the reply that follows is entirely successful either way. An exact id wins
+    outright - that is the machine-readable name and there is nothing to weigh against
+    it - and a single search hit is taken because a search that found one thing is not
+    ambiguous.
+    """
+    query = name.strip()
+    if not query:
+        raise ComfyError("install_extension needs the name of a pack.")
+
+    direct = await R.fetch(CFG, query)
+    if direct is not None:
+        return direct
+
+    listings, _ = await R.search(CFG, query, R.SEARCH_LIMIT, 1)
+    wanted = E.normalise(query)
+    exact = [
+        item
+        for item in listings
+        if E.normalise(item.id) == wanted or E.normalise(item.name) == wanted
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(listings) == 1:
+        return listings[0]
+    if not listings:
+        raise ComfyError(
+            f"the Comfy Registry has no pack matching {query!r}. Plenty of packs live on "
+            "GitHub and were never published there, so this is not evidence that no such "
+            "pack exists - it is evidence that the registry cannot vouch for one, and "
+            "this tool installs only what it can vouch for. search_extensions is the "
+            "place to look around."
+        )
+    names = ", ".join(sorted(item.id for item in listings[:15]))
+    raise ComfyError(
+        f"{query!r} matches {len(listings)} registry entries: {names}"
+        f"{' and more' if len(listings) > 15 else ''}. Name one of them exactly - this "
+        "server will not pick, because installing the wrong pack looks exactly like "
+        "installing the right one."
+    )
+
+
+async def _manager_ready() -> dict[str, Any]:
+    """ComfyUI-Manager, present, permitted and not already busy - or a refusal saying which.
+
+    All three are checked before anything is written because all three produce the same
+    thing otherwise: an install that appears to have been accepted and did not happen.
+    The busy check is the one that is easy to miss - Manager's queue is shared with
+    ComfyUI's own Manager panel, and its results dict is keyed by `ui_id` and cleared
+    wholesale when the queue drains, so two installs at once take each other's answers.
+    """
+    if not await CLIENT.is_alive():
+        raise ComfyError(
+            f"ComfyUI is not answering on {CFG.base_url}, and installing goes through "
+            "ComfyUI-Manager's own HTTP queue - which only exists while ComfyUI is "
+            "running. comfy_start starts it. (repair_extension is the half that does not "
+            "need it, and is the one to use with ComfyUI stopped.)"
+        )
+    info = await M.probe(CFG, CLIENT)
+    refusal = info.get("refusal")
+    if refusal:
+        raise ComfyError(str(refusal))
+    if E.queue_is_busy(info.get("queue") or {}):
+        raise ComfyError(
+            "ComfyUI-Manager's install queue is busy with something else - probably its "
+            "own panel in the browser. Starting into it would hand this install somebody "
+            "else's result and them ours, because Manager reports the whole queue at once "
+            "and keys it by an id we chose. Wait for it to finish and call again."
+        )
+    return info
+
+
+async def _plan_for(requirements: list[str]) -> dict[str, Any]:
+    """Freeze, plan, and judge - the three steps every package-touching tool starts with.
+
+    Returns the pieces rather than a verdict, because what each caller does with an
+    unsafe plan differs: installing refuses outright, repairing has a pack on disk
+    already and has to say what that means.
+    """
+    env = await _environment()
+    uv = _uv(env.uv, env.python, CFG.package_timeout)
+    try:
+        pins = await uv.freeze()
+        planner = _uv(env.uv, env.python, CFG.package_timeout, E.torch_index_url(pins))
+        plan = await planner.dry_run(requirements) if requirements else None
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    risks = E.plan_risks(plan, pins) if plan is not None else []
+    return {
+        "env": env,
+        "pins": pins,
+        "plan": plan,
+        "risks": risks,
+        "additive": bool(plan is not None and E.plan_is_additive(plan)),
+        "disturbs": bool(plan is not None and E.disturbs_installed(plan)),
+        "uv": _uv(env.uv, env.python, CFG.package_timeout, E.torch_index_url(pins)),
+    }
+
+
+def _plan_report(judged: dict[str, Any], requirements: list[str]) -> dict[str, Any]:
+    plan = judged["plan"]
+    risks = judged["risks"]
+    out: dict[str, Any] = {
+        "requirements": list(requirements),
+        "plan": plan.as_dict() if plan is not None else None,
+        "risks": [{"package": r.name, "rule": r.rule, "detail": r.detail} for r in risks],
+        "index": CFG.package_index or "https://pypi.org/simple (uv's default)",
+    }
+    if plan is not None:
+        out["additive_only"] = judged["additive"]
+    if not requirements:
+        out["plan_note"] = "This pack declares no Python requirements, so nothing was planned."
+    return out
+
+
+def _risk_refusal(judged: dict[str, Any], what: str) -> str:
+    names = ", ".join(sorted({r.name for r in judged["risks"]}))
+    return (
+        f"refusing to {what}: its requirements would move {names}, whose version belongs "
+        "to this install's CUDA build rather than to any requirement. That is the failure "
+        "this whole tool exists to prevent - the install would succeed, nothing in its "
+        "output would be an error, and the GPU would stop being used. plan_packages shows "
+        "the whole plan. The way through is to pin the requirement to something the torch "
+        "already here satisfies, which is a decision for a person."
+    )
+
+
+PACKAGES_WITH_COMFY_RUNNING = (
+    "Only new packages were installed, which is safe while ComfyUI is running: nothing "
+    "already imported was replaced."
+)
+
+PACKAGES_DEFERRED = (
+    "The packages were NOT installed. This plan moves versions of packages that are "
+    "already installed, and ComfyUI has them loaded - on Windows, replacing a file a "
+    "running process has open fails outright, and a half-replaced package is worse than "
+    "an uninstalled one. Stop ComfyUI with comfy_stop and call repair_extension, which "
+    "does the package half on its own and needs neither ComfyUI nor ComfyUI-Manager."
+)
+
+
+async def _install_requirements(
+    judged: dict[str, Any], requirements: list[str], checkpoint_name: str
+) -> dict[str, Any]:
+    """Install a planned set and report the difference it actually made.
+
+    The diff is measured rather than taken from the plan. A plan is a prediction made
+    against an index, and the thing worth reporting is what the environment now holds -
+    which is also the only form in which "nothing moved" is trustworthy.
+    """
+    uv = judged["uv"]
+    before = judged["pins"]
+    result = await uv.install(requirements)
+    after = await uv.freeze()
+    difference = E.diff(before, after)
+    out: dict[str, Any] = {
+        "packages_installed": result.ok,
+        "diff": difference.as_dict(),
+        "checkpoint": checkpoint_name,
+    }
+    if not result.ok:
+        out["package_error"] = result.out.strip()[-2000:]
+        out["hint"] = (
+            "The pack's files are in place but its Python requirements did not install, so "
+            "its import will fail and its nodes will be missing. get_comfy_log says how, "
+            "and repair_extension retries just this half."
+        )
+    return out
+
+
+@tool("extensions_install", "writes")
+async def install_extension(
+    name: str,
+    version: str = "latest",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Install a node pack from the Comfy Registry, with a checkpoint and a refusal first.
+
+    **The order is the whole design.** What installing a pack does to this machine is
+    almost never about the pack's own files - those are a folder that
+    `set_extension_enabled` can hide again in one rename. It is about the packages its
+    requirements move, and that is irreversible without a record. So: the plan is read
+    before anything is fetched and an unsafe one is refused outright; a checkpoint is
+    written whether or not anyone asked; and the difference the install actually made is
+    measured afterwards rather than taken from the plan.
+
+    **The fetching is ComfyUI-Manager's and the packages are this server's.** Manager
+    resolves the registry id, downloads the archive and places it with its own
+    conventions - reimplementing that would be a second set of conventions for the same
+    folders. But its post-install step pip-installs `requirements.txt` one line at a
+    time with nothing watching torch, and runs the pack's own `install.py`, which is
+    arbitrary code. This asks it to skip that step and does the package half here.
+
+    Two consequences to know about, both reported in the reply rather than hidden:
+
+    - **A pack shipping `install.py` is only partly installed by this route.** That
+      script is not run. Most packs do not have one; a pack that does may need a person.
+    - **Packages that move an already-installed version are not installed while ComfyUI
+      is running**, because it has them loaded and replacing a loaded file fails on
+      Windows. The pack lands, the packages wait, and `repair_extension` finishes the
+      job with ComfyUI stopped.
+
+    Args:
+        name: the pack's registry id, or something that identifies one entry. Ambiguity
+            is refused rather than guessed at.
+        version: which released version, or "latest". Not a git ref - Manager rates
+            every `nightly` and every unknown git URL as high risk and refuses them at
+            the usual security level, and this server does not work around that.
+        dry_run: read the plan and stop. Nothing is fetched, nothing is written, and no
+            checkpoint is taken. This is the call to make first.
+    """
+    listing = await _resolve_listing(name)
+    candidate = E.as_pack(listing)
+    installed = P.read_packs(CFG)
+
+    clash = E.conflicts(installed, candidate)
+    if clash:
+        raise ComfyError(
+            f"{clash[0].name} is already installed and enabled"
+            + (f" at version {clash[0].version}" if clash[0].version else "")
+            + f", and it is the same pack as {listing.id}. update_extension changes its "
+            "version; describe_extension says whether its nodes actually load, which is "
+            "the usual reason somebody reaches for a reinstall."
+        )
+    disabled = [p for p in installed if E.same_pack(p, candidate)]
+    if disabled:
+        raise ComfyError(
+            f"{disabled[0].name} is already here, switched off. set_extension_enabled "
+            "turns it back on - one rename, nothing downloaded, no package moved, and it "
+            "works with ComfyUI stopped. Installing over a folder somebody deliberately "
+            "disabled is rarely what was meant."
+        )
+
+    declared = E.clean_requirements(listing.dependencies)
+    judged = await _plan_for(declared)
+
+    out: dict[str, Any] = {
+        "pack": listing.as_dict(),
+        "version_requested": version.strip() or "latest",
+        "environment": judged["env"].as_dict(),
+    }
+    out.update(_plan_report(judged, declared))
+    out["requirements_source"] = "the registry's copy of the pack's own metadata"
+
+    if judged["risks"]:
+        out["refused"] = True
+        raise ComfyError(_risk_refusal(judged, f"install {listing.id}"))
+
+    if dry_run:
+        out["dry_run"] = True
+        out["installed"] = False
+        out["hint"] = (
+            "Nothing was fetched and nothing was written. The requirements above are what "
+            "the registry says this pack declares; the copy on disk can differ, and is "
+            "read again after it lands."
+        )
+        return out
+
+    manager = await _manager_ready()
+    out["manager"] = {"version": manager.get("version"), "security_level": manager.get("security_level")}
+
+    checkpoint = await create_checkpoint(note=f"before installing {listing.id}")
+    checkpoint_name = str(checkpoint["checkpoint"].get("name", ""))
+    out["checkpoint"] = checkpoint_name
+
+    result = await M.run_install(CFG, CLIENT, listing.id, version.strip() or "latest", CFG.package_timeout)
+    out["manager_result"] = result
+    if not result.get("ok"):
+        out["installed"] = False
+        out["hint"] = (
+            f"ComfyUI-Manager did not install {listing.id}: {result.get('message')}. "
+            "Nothing was installed and no package moved. get_comfy_log carries whatever "
+            "it printed while trying."
+        )
+        return out
+
+    out["installed"] = True
+
+    placed = [p for p in P.read_packs(CFG) if E.same_pack(p, candidate)]
+    if not placed:
+        out["hint"] = (
+            f"ComfyUI-Manager reported success, but no pack matching {listing.id} is on "
+            "disk. describe_environment lists what is; that disagreement is worth reading "
+            "get_comfy_log about before anything else."
+        )
+        return out
+
+    pack = placed[0]
+    out["pack_on_disk"] = pack.as_dict()
+    wanted, set_aside = P.pack_requirements(CFG, pack)
+    if set_aside:
+        out["requirements_set_aside"] = set_aside
+        out["requirements_set_aside_note"] = (
+            "These lines are instructions to pip rather than requirements - another file "
+            "to read, a working tree to install from, or an index to resolve against. "
+            "None was honoured, and the last kind changes where every package comes from."
+        )
+    out["requirements_on_disk"] = wanted
+
+    if P.has_install_script(CFG, pack):
+        out["install_script"] = str(P.pack_location(CFG, pack) or "")
+        out["install_script_note"] = (
+            "This pack ships an install.py, and it was not run. ComfyUI-Manager's "
+            "post-install step would have executed it - arbitrary code from the pack, at "
+            "install time, with no sandbox - which is the step this server asks it to "
+            "skip. If the pack turns out to need it, that is a decision and a command for "
+            "a person at a terminal."
+        )
+
+    if not wanted:
+        out["restart"] = P.RESTART_NEEDED
+        out["hint"] = (
+            f"{pack.name} is installed and declares no Python requirements. Restart "
+            "ComfyUI, then describe_extension says whether its nodes registered."
+        )
+        return out
+
+    second = await _plan_for(wanted)
+    out["plan_on_disk"] = second["plan"].as_dict() if second["plan"] is not None else None
+    if second["risks"]:
+        out["packages_installed"] = False
+        out["risks_on_disk"] = [
+            {"package": r.name, "rule": r.rule, "detail": r.detail} for r in second["risks"]
+        ]
+        out["hint"] = (
+            f"{pack.name} is on disk, and its packages were NOT installed: the "
+            "requirements.txt that arrived with it asks for something the registry's copy "
+            "did not, and it would move a package belonging to this install's CUDA build. "
+            "The pack is inert until its requirements are met - its import will fail, "
+            "which is visible and harmless - and set_extension_enabled hides it entirely. "
+            "restore_checkpoint is not needed: no package has moved."
+        )
+        return out
+
+    if second["disturbs"]:
+        out["packages_installed"] = False
+        out["packages_note"] = PACKAGES_DEFERRED
+        out["restart"] = P.RESTART_NEEDED
+        out["hint"] = (
+            f"{pack.name} is on disk. Its requirements move packages that are already "
+            "installed, so they were left alone: comfy_stop, then "
+            f"repair_extension({pack.name!r}), then comfy_start."
+        )
+        return out
+
+    out.update(await _install_requirements(second, wanted, checkpoint_name))
+    out.setdefault("packages_note", PACKAGES_WITH_COMFY_RUNNING)
+    out["restart"] = P.RESTART_NEEDED
+    out.setdefault(
+        "hint",
+        f"{pack.name} is installed. Restart ComfyUI, then describe_extension says whether "
+        "its nodes registered - a pack that registers none is one whose import died, and "
+        "get_comfy_log carries the traceback.",
+    )
+    return out
+
+
+@tool("extensions_install", "writes")
+async def update_extension(
+    name: str,
+    version: str = "latest",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Move an installed node pack to another released version - forwards or back.
+
+    The same machinery as `install_extension` and the same guarantees: the plan is read
+    first and an unsafe one refused, a checkpoint is written, and the difference is
+    measured afterwards. What differs is the precondition - the pack must already be
+    here - and that going back is as ordinary as going forward. A pack that broke after
+    an update is fixed by naming the version that worked.
+
+    **`update_available` compares strings and nothing more**, here as everywhere: a
+    pack's version is whatever its author typed, and the ones on this machine include
+    `1.5.0`, `2.0.0`, `0.1` and nine empty strings. Ordering those needs a rule none of
+    them agreed to. So this tool does not decide what "newer" is; it moves to the
+    version it is given.
+
+    Args:
+        name: the installed pack, by folder name, registry id, or part of either.
+        version: the released version to move to, or "latest".
+        dry_run: read the plan and stop.
+    """
+    pack = _resolve_pack(name)
+    if not pack.enabled:
+        raise ComfyError(
+            f"{pack.name} is disabled, and updating a folder ComfyUI is not loading is "
+            "work with no effect. set_extension_enabled turns it on first."
+        )
+    listing = await _listing_for(pack)
+    if listing is None:
+        raise ComfyError(
+            f"the Comfy Registry has no entry for {pack.name}, so there is no published "
+            "version to move it to. That is ordinary - a pack cloned from GitHub was "
+            "never published - and it means updating it is a git operation, which this "
+            "server does not do. repair_extension reinstalls its requirements, which is "
+            "the other half of what an update usually fixes."
+        )
+
+    wanted = version.strip() or "latest"
+    declared = E.clean_requirements(listing.dependencies)
+    judged = await _plan_for(declared)
+
+    out: dict[str, Any] = {
+        "pack": pack.as_dict(),
+        "registry": listing.as_dict(),
+        "from_version": pack.version,
+        "to_version": wanted,
+        "environment": judged["env"].as_dict(),
+    }
+    out.update(_plan_report(judged, declared))
+
+    if judged["risks"]:
+        raise ComfyError(_risk_refusal(judged, f"update {pack.name}"))
+
+    if dry_run:
+        out["dry_run"] = True
+        out["changed"] = False
+        return out
+
+    manager = await _manager_ready()
+    out["manager"] = {"version": manager.get("version"), "security_level": manager.get("security_level")}
+
+    checkpoint = await create_checkpoint(note=f"before updating {pack.name} to {wanted}")
+    checkpoint_name = str(checkpoint["checkpoint"].get("name", ""))
+    out["checkpoint"] = checkpoint_name
+
+    result = await M.run_install(CFG, CLIENT, listing.id, wanted, CFG.package_timeout)
+    out["manager_result"] = result
+    if not result.get("ok"):
+        out["changed"] = False
+        out["hint"] = (
+            f"ComfyUI-Manager did not move {pack.name}: {result.get('message')}. Nothing "
+            "changed. Manager reports 'skip' when the pack is already at that version."
+        )
+        return out
+
+    out["changed"] = True
+    now = [p for p in P.read_packs(CFG) if E.same_pack(p, pack)]
+    if now:
+        out["pack_on_disk"] = now[0].as_dict()
+        needed, set_aside = P.pack_requirements(CFG, now[0])
+        out["requirements_on_disk"] = needed
+        if set_aside:
+            out["requirements_set_aside"] = set_aside
+        if needed:
+            second = await _plan_for(needed)
+            out["plan_on_disk"] = (
+                second["plan"].as_dict() if second["plan"] is not None else None
+            )
+            if second["risks"]:
+                out["packages_installed"] = False
+                out["risks_on_disk"] = [
+                    {"package": r.name, "rule": r.rule, "detail": r.detail}
+                    for r in second["risks"]
+                ]
+            elif second["disturbs"]:
+                out["packages_installed"] = False
+                out["packages_note"] = PACKAGES_DEFERRED
+            else:
+                out.update(await _install_requirements(second, needed, checkpoint_name))
+                out.setdefault("packages_note", PACKAGES_WITH_COMFY_RUNNING)
+
+    out["restart"] = P.RESTART_NEEDED
+    out.setdefault(
+        "hint",
+        f"{pack.name} now reports version {wanted}. Restart ComfyUI, then "
+        "describe_extension says whether its nodes still register - which is the thing an "
+        "update most often changes and nothing on the canvas would announce.",
+    )
+    return out
+
+
+@tool("extensions_install", "writes")
+async def repair_extension(name: str, dry_run: bool = False) -> dict[str, Any]:
+    """Install the Python requirements of a pack that is already on disk.
+
+    The other half of installing, on its own - and the half that needs neither
+    ComfyUI-Manager nor a running ComfyUI. That is what makes it the tool for the two
+    situations where the others cannot help: a pack whose import fails for a missing
+    module, and an install that deliberately left its packages for later because they
+    would have moved something ComfyUI had loaded.
+
+    It reads the `requirements.txt` that is actually there rather than the registry's
+    copy, plans it, refuses the plan if it would move a package belonging to this
+    install's CUDA build, writes a checkpoint, and reports the difference it made.
+
+    **Run it with ComfyUI stopped when the plan is not additive.** Replacing a file a
+    running process has open fails outright on Windows, and a half-replaced package is
+    worse than a missing one.
+
+    Args:
+        name: the installed pack, by folder name, registry id, or part of either.
+        dry_run: read the plan and stop.
+    """
+    pack = _resolve_pack(name)
+    wanted, set_aside = P.pack_requirements(CFG, pack)
+
+    out: dict[str, Any] = {
+        "pack": pack.as_dict(),
+        "path": str(P.pack_location(CFG, pack) or ""),
+        "requirements_source": "the pack's own requirements.txt, as it sits on disk",
+    }
+    if set_aside:
+        out["requirements_set_aside"] = set_aside
+
+    if not wanted:
+        out["repaired"] = False
+        out["hint"] = (
+            f"{pack.name} declares no Python requirements on disk, so there is nothing "
+            "here to reinstall. If its nodes do not register, the reason is in "
+            "get_comfy_log rather than in a missing package."
+        )
+        return out
+
+    judged = await _plan_for(wanted)
+    out.update(_plan_report(judged, wanted))
+    out["environment"] = judged["env"].as_dict()
+
+    if judged["risks"]:
+        raise ComfyError(_risk_refusal(judged, f"repair {pack.name}"))
+
+    if dry_run:
+        out["dry_run"] = True
+        out["repaired"] = False
+        return out
+
+    if judged["plan"] is not None and judged["plan"].no_changes:
+        out["repaired"] = False
+        out["hint"] = (
+            f"Every requirement {pack.name} declares is already installed at a satisfying "
+            "version, so nothing was done. If its nodes still do not register, the cause "
+            "is not a missing package - get_comfy_log has the traceback."
+        )
+        return out
+
+    if judged["disturbs"] and await CLIENT.is_alive():
+        raise ComfyError(
+            f"refusing to repair {pack.name} while ComfyUI is running: this plan moves "
+            "packages that are already installed, and ComfyUI has them loaded. On Windows "
+            "replacing a file a running process holds open fails outright, and a "
+            "half-replaced package is worse than a missing one. comfy_stop, call again, "
+            "then comfy_start. The plan above is what it would do."
+        )
+
+    checkpoint = await create_checkpoint(note=f"before repairing {pack.name}")
+    checkpoint_name = str(checkpoint["checkpoint"].get("name", ""))
+
+    out.update(await _install_requirements(judged, wanted, checkpoint_name))
+    out["repaired"] = bool(out.get("packages_installed"))
+    out["restart"] = P.RESTART_NEEDED
+    out.setdefault(
+        "hint",
+        f"Restart ComfyUI, then describe_extension says whether {pack.name}'s nodes "
+        "register now.",
+    )
+    return out
+
+
+@tool("extensions_install", "writes")
+async def stage_extension(url: str, ref: str = "", refresh: bool = False) -> dict[str, Any]:
+    """Clone a repository somewhere safe and report what installing it would mean.
+
+    **The answer to "this pack is on GitHub and not in the registry", and it deliberately
+    stops one step short of installing.** The clone goes to a staging directory that is
+    *not* `custom_nodes`, which is the only place ComfyUI looks - so nothing here is
+    imported, no `install.py` runs, and no package moves. What comes back is what a
+    person needs in order to decide: what the pack says it is, what it would install,
+    what that would move in this environment, and whether ComfyUI-Manager would accept
+    it at the security level this ComfyUI is configured with.
+
+    **When Manager would refuse it, that refusal stands.** Its `security_level` is the
+    administrator's answer to whether this ComfyUI may install code from an unvetted
+    repository, and there is no tool here that installs one anyway - the decision to go
+    further belongs to a person at a terminal, who can see this report first. That is
+    the whole reason this tool exists rather than a git-and-pip installer.
+
+    The rating is a *prediction*. It reproduces Manager's own `get_risky_level` against
+    the catalogue on disk, and Manager merges a fresher copy from the network at call
+    time, so this can say "high" where Manager would say "middle" - never the reverse.
+
+    Args:
+        url: an `https://` repository URL. Only that scheme, because anything else
+            reaches something other than a network fetch and a value beginning `-` is an
+            option to git rather than a repository.
+        ref: a branch or tag to clone instead of the default branch.
+        refresh: clone again over a copy already staged. Off by default, so asking twice
+            costs nothing and reads what is there.
+    """
+    refusal = E.check_clone_url(url)
+    if refusal:
+        raise ComfyError(f"refusing to clone: {refusal}")
+
+    root = P.staging_dir(CFG)
+    dest = root / E.repo_folder(url)
+    out: dict[str, Any] = {
+        "url": url.strip(),
+        "staged_at": str(dest),
+        "staging_directory": str(root),
+        "installed": False,
+        "not_installed": P.STAGING_IS_NOT_INSTALLED,
+    }
+
+    if dest.exists() and refresh:
+        try:
+            shutil.rmtree(dest)
+        except OSError as exc:
+            raise ComfyError(f"could not replace the staged copy at {dest}: {exc}") from exc
+
+    if dest.exists():
+        out["cloned"] = False
+        out["clone_note"] = (
+            "A copy was already staged here and was read as it is. Pass refresh=True to "
+            "clone it again."
+        )
+    else:
+        git = P.find_git(CFG)
+        if git is None:
+            raise ComfyError(
+                "there is no git executable to clone with. A portable ComfyUI unpacked "
+                "from a zip routinely has none, which is why nothing else in this server "
+                "shells out to git. Install git, or point ComfyUI-Manager's git_exe at "
+                "one. describe_extension and search_extensions need neither."
+            )
+        result = await P.clone(git, url.strip(), dest, ref, CFG.package_timeout)
+        if not result.ok:
+            raise ComfyError(
+                f"could not clone {url}: {result.out.strip()[-1200:]}"
+            )
+        out["cloned"] = True
+        out["git"] = str(git)
+
+    commit, remote = P.git_state(dest)
+    if commit:
+        out["commit"] = commit
+    if remote:
+        out["remote"] = remote
+    if ref.strip():
+        out["ref"] = ref.strip()
+
+    metadata = {}
+    pyproject = dest / E.COMFY_METADATA
+    if pyproject.is_file():
+        metadata = E.parse_pyproject(
+            pyproject.read_text(encoding="utf-8", errors="replace")
+        )
+    out["declares"] = metadata or None
+    if not metadata:
+        out["metadata_note"] = (
+            "No usable pyproject.toml, so this pack states no registry id and no version "
+            "of its own. That is ordinary for an older pack and it is also why it cannot "
+            "be installed the way a published one is."
+        )
+
+    requirements, set_aside = ([], [])
+    req_file = dest / P.REQUIREMENTS_FILE
+    if req_file.is_file():
+        requirements, set_aside = E.parse_requirements(
+            req_file.read_text(encoding="utf-8", errors="replace")
+        )
+    declared = E.clean_requirements(metadata.get("dependencies") or [])
+    wanted = requirements or declared
+    out["requirements"] = wanted
+    out["requirements_source"] = (
+        "requirements.txt" if requirements else "pyproject.toml" if declared else "nothing"
+    )
+    if set_aside:
+        out["requirements_set_aside"] = set_aside
+
+    if (dest / P.INSTALL_SCRIPT).is_file():
+        out["install_script"] = str(dest / P.INSTALL_SCRIPT)
+        out["install_script_note"] = (
+            "This pack ships an install.py. ComfyUI-Manager's post-install step would run "
+            "it - arbitrary code from the pack, at install time, with no sandbox - and "
+            "nothing here ever does. It is staged where it can be read, which is the "
+            "point: this is the file to look at before deciding."
+        )
+
+    if wanted:
+        judged = await _plan_for(wanted)
+        out.update(_plan_report(judged, wanted))
+        out["environment"] = judged["env"].as_dict()
+        if judged["risks"]:
+            out["would_be_refused"] = True
+            out["hint"] = (
+                "Installing this would move a package whose version belongs to this "
+                "install's CUDA build, so no tool here would carry it out. Nothing has "
+                "been installed; the clone is only a copy to read."
+            )
+    else:
+        out["plan_note"] = "Nothing declares any Python requirements, so nothing was planned."
+
+    candidate = E.Pack(
+        name=E.repo_folder(url),
+        registry_id=str(metadata.get("registry_id") or ""),
+        repo=str(metadata.get("repo") or remote or url),
+    )
+    already = [p for p in P.read_packs(CFG) if E.same_pack(p, candidate)]
+    if already:
+        out["already_installed"] = already[0].as_dict()
+        out["already_installed_note"] = (
+            "The same pack is already in custom_nodes - matched by registry id or git "
+            "remote rather than by folder name. describe_extension says whether its nodes "
+            "load, which is usually the real question."
+        )
+
+    urls, pip = M.node_list(CFG)
+    if urls:
+        rating = E.manager_rating(urls, pip, [url.strip().rstrip("/")], wanted)
+        settings = M.read_settings(CFG)
+        level = settings.get("security_level", "") or "unknown"
+        out["manager"] = {
+            "predicted_rating": rating,
+            "security_level": level,
+            "catalogue_entries": len(urls),
+        }
+        if rating == E.RATING_INSTALLABLE:
+            out["manager"]["means"] = (
+                "ComfyUI-Manager already knows this repository, so it would rate a git "
+                "install of it 'middle' - which its usual security levels permit."
+            )
+        elif rating == E.RATING_UNKNOWN_PIP:
+            out["manager"]["means"] = (
+                "ComfyUI-Manager knows this repository but not every pip package it asks "
+                "for, which it rates 'block' - refused at every security level, including "
+                "the weakest."
+            )
+        else:
+            out["manager"]["means"] = (
+                "ComfyUI-Manager does not know this repository, so it would rate a git "
+                f"install of it 'high', which needs security_level 'weak' and this one is "
+                f"{level!r}. That refusal is the administrator's setting and nothing here "
+                "works around it: no tool in this server installs from a git URL. Whether "
+                "to go further is a decision for a person, and this report is what it "
+                "should be made on."
+            )
+        out["manager"]["prediction_note"] = (
+            "A prediction from the catalogue on disk. Manager merges a fresher copy from "
+            "the network when it is actually asked, so this can be stricter than Manager "
+            "and never looser."
+        )
+    else:
+        out["manager"] = {
+            "predicted_rating": None,
+            "means": (
+                "ComfyUI-Manager's catalogue could not be read here, so nothing can be "
+                "said in advance about how it would rate this repository."
+            ),
+        }
+
+    out.setdefault(
+        "hint",
+        "Nothing has been installed. The clone is a copy to read - its requirements, its "
+        "install.py, its code. If it turns out to be wanted and it is published, "
+        "search_extensions will find it and install_extension will install it properly; "
+        "if it is not published, going further is a decision and a command for a person.",
+    )
     return out
 
 

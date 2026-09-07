@@ -10,7 +10,7 @@ then lies about itself.
 
 Three reasons this exists, and only the last is about safety:
 
-*Context.* All 60 schemas reach the model at the start of every session. Somebody
+*Context.* All 64 schemas reach the model at the start of every session. Somebody
 who only ever runs workflow files pays for twenty canvas tools they never call.
 
 *The decision is made when nobody is in a hurry.* A permission prompt raised in
@@ -338,6 +338,41 @@ GROUPS: tuple[Group, ...] = (
         ),
     ),
     Group(
+        name="extensions_install",
+        title=Text(en="Extensions: installing", ru="Расширения: установка"),
+        risk="writes",
+        summary=Text(
+            en=(
+                "Installing a node pack from the Comfy Registry, moving one to another released "
+                "version, and installing the Python requirements of one already on disk."
+            ),
+            ru=(
+                "Установка пака нод из Comfy Registry, перевод установленного на другую выпущенную "
+                "версию и установка python-требований того, что уже лежит на диске."
+            ),
+        ),
+        warning=Text(
+            en=(
+                "This is the group that changes the Python environment, which is the part of "
+                "installing that cannot be undone by moving a folder. Every call reads the plan "
+                "first and refuses one that would move a package belonging to this install's CUDA "
+                "build, writes a checkpoint whether or not it was asked to, and reports the "
+                "difference it actually made. The fetching is ComfyUI-Manager's, so its own "
+                "security_level still decides what may be installed - nothing here works around "
+                "it - and a pack's install.py is deliberately never run."
+            ),
+            ru=(
+                "Это та группа, которая меняет python-окружение, а именно эта часть установки и не "
+                "отменяется перемещением папки. Каждый вызов сперва читает план и отказывается от "
+                "того, который сдвинул бы пакет из CUDA-сборки этой установки, пишет чекпойнт - "
+                "просили о нём или нет - и сообщает, что изменилось на самом деле. Скачивает "
+                "ComfyUI-Manager, так что его собственный security_level по-прежнему решает, что "
+                "вообще можно поставить: ничего здесь его не обходит. Install.py пака намеренно "
+                "не запускается никогда."
+            ),
+        ),
+    ),
+    Group(
         name="process",
         title=Text(en="Process and tab", ru="Процесс и вкладка"),
         risk="process",
@@ -368,6 +403,84 @@ _NO_POLL = Text(
 )
 
 DEPENDS: tuple[tuple[str, tuple[str, ...], Text], ...] = (
+    (
+        "install_extension",
+        ("plan_packages",),
+        Text(
+            en=(
+                "installing can change the Python environment with no way to ask beforehand "
+                "what a set of requirements would move"
+            ),
+            ru=(
+                "установка может менять python-окружение, а спросить заранее, что сдвинет набор "
+                "требований, будет нечем"
+            ),
+        ),
+    ),
+    (
+        "install_extension",
+        ("restore_checkpoint",),
+        Text(
+            en=(
+                "a checkpoint is written before every install and there is nothing here that "
+                "can put one back, which is most of what it was for"
+            ),
+            ru=(
+                "перед каждой установкой пишется чекпойнт, но вернуть его будет нечем, а ведь "
+                "ради этого он в основном и нужен"
+            ),
+        ),
+    ),
+    (
+        "install_extension",
+        ("set_extension_enabled",),
+        Text(
+            en=(
+                "a pack that turns out to break ComfyUI cannot be switched off again, which is "
+                "the cheap undo the expensive one is meant to avoid needing"
+            ),
+            ru=(
+                "пак, который окажется ломающим ComfyUI, нельзя будет выключить - а это дешёвая "
+                "отмена, ради которой и существует дорогая"
+            ),
+        ),
+    ),
+    (
+        "install_extension",
+        ("describe_extension",),
+        Text(
+            en=(
+                "nothing will say whether the installed pack's nodes actually registered, which "
+                "is the only evidence that the install worked"
+            ),
+            ru=(
+                "ничто не скажет, зарегистрировались ли ноды установленного пака - а это "
+                "единственное свидетельство, что установка удалась"
+            ),
+        ),
+    ),
+    (
+        "update_extension",
+        ("restore_checkpoint",),
+        Text(
+            en="an update can move packages and there is nothing here that can put them back",
+            ru="обновление может двигать пакеты, а вернуть их будет нечем",
+        ),
+    ),
+    (
+        "repair_extension",
+        ("comfy_stop",),
+        Text(
+            en=(
+                "repairing refuses to move a loaded package while ComfyUI runs, and nothing "
+                "here can stop it"
+            ),
+            ru=(
+                "починка отказывается двигать загруженный пакет при работающей ComfyUI, а "
+                "остановить её будет нечем"
+            ),
+        ),
+    ),
     (
         "set_extension_enabled",
         ("describe_environment", "describe_extension"),

@@ -324,3 +324,27 @@ def test_the_documentation_still_says_how_many_tools_there_are():
             assert int(written) == total, (
                 f"{name} says {written} tools, the registry has {total}"
             )
+
+
+def test_the_advertised_version_is_the_real_one():
+    """`__version__` is what the MCP handshake tells every client this server is, and
+    it had said 0.1.0 through eight releases.
+
+    Nothing could catch it: the release workflow checks the git tag against
+    `pyproject.toml`, and neither of those two ever reads the third copy. This is the
+    same guard `test_the_documentation_still_says_how_many_tools_there_are` is - a fact
+    written down twice gets a test, because the drift is silent either way.
+    """
+    import re
+
+    from comfyui_mcp import __version__
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    declared = re.search(
+        r'^version = "([^"]+)"', (root / "pyproject.toml").read_text(encoding="utf-8"), re.M
+    )
+    assert declared, "pyproject.toml no longer states a version where this test looks"
+    assert __version__ == declared.group(1), (
+        f"the server tells clients it is {__version__}, pyproject.toml says "
+        f"{declared.group(1)}"
+    )

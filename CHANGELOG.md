@@ -8,6 +8,109 @@ the same thing; the release workflow refuses a tag that disagrees with
 release are these two files, in both languages, and nothing is written by hand at
 tag time.
 
+## 0.1.9 - 07.09.2026
+
+### Added
+
+- **Extensions: three tools that start at both ends of an install and leave the
+  middle for later.** That ordering is the design rather than an accident - an
+  install tool with no undo is the thing this whole concept exists to prevent,
+  so what ships first is the half that answers before anything is downloaded
+  and the half that takes it back.
+
+  **`search_extensions` reads the Comfy Registry, which answers before a single
+  file is on disk.** Each hit carries the pack's own dependency list, so
+  `plan_packages` can be asked what installing it would move while the pack is
+  still a row in somebody else's database - cloning a repository to find out
+  what it wants is precisely what this avoids. No key and no account. It is
+  also a *third host*: measured while pypi.org was unreachable from this
+  machine, the registry answered normally.
+
+  A hit says whether that same pack is already here, compared by registry id
+  and git remote rather than by folder name. A **disabled** copy is reported
+  separately and is deliberately not a conflict: `ComfyUI-WanVideoWrapper` is
+  installed twice on this machine - enabled, and a disabled `@nightly` checkout
+  - under one registry id, and a duplicate check counting the second would
+  refuse to touch the copy actually in use over a folder somebody switched off.
+
+  **`describe_extension` finally joins the three sources instead of counting
+  them against each other.** `/object_info` carries `python_module` on every
+  entry, and on this install it is exactly `custom_nodes.<folder name>` - 208
+  distinct modules across 2823 node types. So the question a person actually
+  has is now answerable: does this pack's nodes load. A pack that is installed,
+  enabled and registers zero types is one whose import died, and ComfyUI
+  catches that and carries on - nothing on the canvas says so, and every
+  workflow using it simply has holes where its nodes were. `get_comfy_log` is
+  where the traceback is.
+
+  Naming a pack is harder than it looks. The registry calls it
+  `comfyui-kjnodes`, its `pyproject.toml` agrees, the folder here is
+  `comfyui-kjnodes`, on the next machine `ComfyUI-KJNodes`, and the person says
+  "kjnodes". An exact match on either machine-readable identity wins outright;
+  a substring returns **everything** it matched rather than picking, because
+  acting on the wrong pack looks exactly like acting on the right one.
+  `describe_extension("comfyui")` matches 26 packs here and is refused.
+
+  **`set_extension_enabled` is the safest tool in the concept and the one to
+  reach for first.** One rename inside `custom_nodes`: nothing is downloaded,
+  no package moves, and the same call with the other value puts it back. When a
+  pack breaks ComfyUI's startup this is the fix - and it is the fix that still
+  works then, needing neither a running ComfyUI nor a network, which is exactly
+  what ComfyUI-Manager's own HTTP route cannot say.
+
+  Manager's two spellings are both honoured, and the asymmetry between them is
+  the rule: it *writes* `custom_nodes/.disabled/<name>` and *reads* that plus
+  the older `<name>.disabled`, so a pack switched off years ago comes back.
+  A state rather than a toggle, so asking for the state a pack is already in
+  changes nothing. `rename` is used rather than `shutil.move` because it
+  refuses to overwrite: both copies on disk at once is a state Manager can
+  produce, and the folders in `custom_nodes` are the user's.
+
+  Disabling moves the folder and nothing else - the pack's Python packages stay
+  installed, since they are shared and uninstalling one pack's requirements
+  routinely takes another pack's with them.
+
+### Fixed
+
+- **The server told every client it was 0.1.0, and had done through eight
+  releases.** `__version__` in `src/comfyui_mcp/__init__.py` is what goes out in
+  the MCP handshake, and it is a third copy of the version: the release workflow
+  compares the git tag against `pyproject.toml`, and neither of those two ever
+  reads it. Now in step, and pinned by a test - the same guard the tool count
+  has, because a fact written down twice drifts silently either way.
+
+- **A pack's declared dependencies can contain things that are not
+  dependencies, and both sources repeat them.** `ComfyUI-MMAudio` ships
+  `"# for Image utils"` and `"# for T5XXL tokenizer (SD3/FLUX)"` as entries in
+  its `pyproject.toml` dependency list - a `requirements.txt` converted to TOML
+  by something that kept the comment lines - and the registry mirrors the
+  pack's own metadata, so it arrives that way from the disk and from the
+  network both. Handing that to uv fails a whole plan over a line that was
+  never a requirement. Only a leading `#` is dropped: a `#` further along is
+  routinely part of a direct reference (`pkg @ https://host/x.whl#sha256=...`),
+  and truncating there produces a requirement that installs different bytes.
+
+- **The explanation written into the "could not move it" message was wrong, and
+  measuring it said the opposite.** Renaming a directory that holds a *loaded*
+  `.pyd` succeeds on Windows 11 - the module loader opens it with
+  `FILE_SHARE_DELETE`, so the mapping does not pin the path. What refuses is an
+  ordinary open handle, which is what `open()` produces by default: a pack's
+  log, cache or database. So a running ComfyUI is usually not in the way, the
+  move is attempted rather than pre-refused, and the message now names the real
+  cause. Verified live with ComfyUI running: a disabled pack made a full round
+  trip and came back where it started.
+
+### Settings
+
+- `COMFYUI_PACKAGE_INDEX` - empty means PyPI, uv's own default. Set it when
+  PyPI cannot be reached. **Whoever sets it is trusted with what gets
+  installed**, since a mirror serves the bytes, so `plan_packages` reports the
+  index it used on every call.
+
+- `COMFYUI_REGISTRY_URL` - empty means `https://api.comfy.org`, which needs no
+  account. For a mirror or a proxy; it is not an off switch, `COMFYUI_TOOLS` is.
+- `COMFYUI_REGISTRY_TIMEOUT`.
+
 ## 0.1.8 - 07.09.2026
 
 ### Added

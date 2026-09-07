@@ -77,6 +77,13 @@ class Config:
     package_timeout: float
     audit_timeout: float
 
+    # the Comfy Registry, which is a separate host from ComfyUI and from PyPI
+    registry_url: str
+    registry_timeout: float
+
+    # where packages come from, when PyPI itself is not reachable
+    package_index: str
+
     # downloading models
     download_token: str
     download_retries: int
@@ -294,6 +301,9 @@ def load_config() -> Config:
         checkpoint_keep=_int("COMFYUI_CHECKPOINT_KEEP", 5),
         package_timeout=_float("COMFYUI_PACKAGE_TIMEOUT", 900),
         audit_timeout=_float("COMFYUI_AUDIT_TIMEOUT", 300),
+        registry_url=_str("COMFYUI_REGISTRY_URL", ""),
+        registry_timeout=_float("COMFYUI_REGISTRY_TIMEOUT", 30),
+        package_index=_str("COMFYUI_PACKAGE_INDEX", ""),
         download_token=_str("COMFYUI_DOWNLOAD_TOKEN", ""),
         download_retries=_int("COMFYUI_DOWNLOAD_RETRIES", 5),
         download_allow_hosts=_str("COMFYUI_DOWNLOAD_ALLOW_HOSTS", DEFAULT_DOWNLOAD_HOSTS),

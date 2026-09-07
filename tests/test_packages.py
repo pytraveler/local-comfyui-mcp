@@ -466,3 +466,44 @@ def test_the_worst_is_still_first_once_duplicates_are_gone():
     dedupe the second sorted above the first."""
     names = [r["name"] for r in P.summarise_audit(AUDIT, PINS)["vulnerable"]]
     assert names.index("aiohttp") < names.index("gitpython")
+
+
+def test_uv_uses_pypi_when_nothing_is_configured(cfg):
+    """The case almost everybody is in has to stay byte-for-byte what it was: no index
+    argument at all, so uv's own default applies."""
+    uv = P.Uv(Path("uv.exe"), Path("python.exe"), 60)
+    argv = uv._base("install")
+    assert "--default-index" not in argv
+
+
+def test_a_configured_index_reaches_every_uv_call(monkeypatch, tmp_path):
+    """Measured need: pypi.org's TLS handshake takes 10.2 s on the machine this was
+    written on, which is past uv's connect deadline, while a mirror answers in 0.4 s.
+    Without this there is no way to tell the server about one."""
+    uv = P.Uv(Path("uv.exe"), Path("python.exe"), 60, default_index="https://mirror/simple/")
+    for verb in ("install", "list", "sync"):
+        argv = [str(a) for a in uv._base(verb)]
+        assert argv[argv.index("--default-index") + 1] == "https://mirror/simple/"
+
+
+def test_the_index_is_stripped_of_stray_whitespace():
+    """A settings window writes every key it edits, and a pasted URL carries a newline."""
+    uv = P.Uv(Path("uv.exe"), Path("python.exe"), 60, default_index="  https://m/  ")
+    assert uv.default_index == "https://m/"
+    blank = P.Uv(Path("uv.exe"), Path("python.exe"), 60, default_index="   ")
+    assert "--default-index" not in blank._base("install")
+
+
+def test_the_two_indexes_are_different_questions():
+    """`--default-index` is where everything comes from; `--extra-index-url` is the
+    torch one, derived from what is installed. Both can be in play at once."""
+    uv = P.Uv(
+        Path("uv.exe"),
+        Path("python.exe"),
+        60,
+        index_url="https://download.pytorch.org/whl/cu130",
+        default_index="https://mirror/simple/",
+    )
+    argv = [str(a) for a in uv._base("install")] + uv._index()
+    assert "--default-index" in argv and "--extra-index-url" in argv
+    assert argv[argv.index("--extra-index-url") + 1] == "https://download.pytorch.org/whl/cu130"

@@ -589,8 +589,33 @@ def parse_pyproject(text: str) -> dict:
         "repo": repo,
         "publisher": str(comfy.get("PublisherId", "") or ""),
         "display_name": str(comfy.get("DisplayName", "") or ""),
-        "dependencies": [str(d) for d in deps] if isinstance(deps, list) else [],
+        "dependencies": clean_requirements(deps) if isinstance(deps, list) else [],
     }
+
+
+def clean_requirements(items: list) -> list[str]:
+    """A pack's declared dependencies, with the lines that are not dependencies removed.
+
+    **Measured, and the reason this function exists:** `ComfyUI-MMAudio` declares
+
+        dependencies = ["accelerate>=0.33.0", ..., "# for Image utils", "imagesize>=1.4.1",
+                        ..., "# for T5XXL tokenizer (SD3/FLUX)", "sentencepiece>=0.2.0"]
+
+    - a `requirements.txt` converted to TOML by something that kept the comment lines as
+    list entries. The registry mirrors the pack's own metadata, so it arrives that way
+    from both sources, and `plan_packages` is documented as taking this list: handing uv
+    `# for Image utils` fails the whole plan over a line that was never a requirement.
+
+    Only a leading `#` counts as a comment. A `#` further along is routinely part of a
+    direct reference (`pkg @ https://host/x.whl#sha256=...`), and truncating there would
+    quietly produce a requirement that installs the wrong bytes.
+    """
+    out = []
+    for item in items:
+        text = str(item).strip()
+        if text and not text.startswith("#"):
+            out.append(text)
+    return out
 
 
 def same_pack(a: Pack, b: Pack) -> bool:
@@ -626,3 +651,248 @@ def repo_key(url: str) -> str:
             break
     parts = [p for p in re.split(r"[:/]", text) if p]
     return "/".join(parts[-2:]).lower() if len(parts) >= 2 else text.lower()
+
+
+REGISTRY_URL = "https://api.comfy.org"
+
+
+@dataclass
+class Listing:
+    """One node pack as the Comfy Registry describes it.
+
+    `dependencies` is the field worth the whole call: the registry states a pack's
+    Python requirements *before* anything is cloned, so `plan_packages` can be asked
+    what installing it would move while the pack is still somebody else's problem.
+    Measured on `comfyui-kjnodes`: `["pillow>=10.3.0", "color-matcher", "matplotlib"]`.
+    """
+
+    id: str
+    name: str = ""
+    repo: str = ""
+    version: str = ""
+    description: str = ""
+    publisher: str = ""
+    downloads: int = 0
+    stars: int = 0
+    deprecated: bool = False
+    banned: bool = False
+    dependencies: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        out: dict = {"id": self.id, "name": self.name}
+        for key in ("repo", "version", "publisher", "description"):
+            value = getattr(self, key)
+            if value:
+                out[key] = value
+        if self.downloads:
+            out["downloads"] = self.downloads
+        if self.stars:
+            out["github_stars"] = self.stars
+        if self.dependencies:
+            out["dependencies"] = list(self.dependencies)
+        if self.deprecated:
+            out["deprecated"] = True
+        if self.banned:
+            out["banned"] = True
+        return out
+
+
+def parse_listing(data: dict) -> Listing | None:
+    """One `/nodes` entry, keeping the handful of fields that decide anything.
+
+    A search result is 25 fields wide and most of them are empty on every pack
+    measured - `banner_url`, `category`, `supported_os`, `tags`, two separate status
+    fields. Passing that through would be a page of nothing per hit, so this is
+    `summarise_schema`'s rule applied to somebody else's payload: report a value only
+    when it is not the boring answer.
+
+    Total by construction. The registry adds fields without warning, and a search that
+    raises because one pack has a null where a string was is worse than one that
+    reports the pack with a blank.
+    """
+    if not isinstance(data, dict):
+        return None
+    node_id = str(data.get("id") or "").strip()
+    if not node_id:
+        return None
+
+    latest = data.get("latest_version")
+    latest = latest if isinstance(latest, dict) else {}
+    deps = latest.get("dependencies")
+    publisher = data.get("publisher")
+    publisher = publisher if isinstance(publisher, dict) else {}
+
+    def whole(value: object) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    return Listing(
+        id=node_id,
+        name=str(data.get("name") or node_id),
+        repo=str(data.get("repository") or ""),
+        version=str(latest.get("version") or ""),
+        description=str(data.get("description") or "").strip(),
+        publisher=str(publisher.get("name") or publisher.get("id") or ""),
+        downloads=whole(data.get("downloads")),
+        stars=whole(data.get("github_stars")),
+        deprecated=bool(latest.get("deprecated")),
+        banned=str(data.get("status") or "") == "NodeStatusBanned",
+        dependencies=clean_requirements(deps) if isinstance(deps, list) else [],
+    )
+
+
+def parse_search(data: dict) -> tuple[list[Listing], dict]:
+    """The `/nodes/search` payload: the hits, and where they sit in the whole result.
+
+    The paging half is reported rather than dropped because the count is the answer to
+    a question the hits cannot settle: `wan` matches 135 packs here, and a caller shown
+    ten of them with no total has no way to tell a narrow query from a truncated one.
+    """
+    if not isinstance(data, dict):
+        return [], {}
+    rows = data.get("nodes")
+    found = [parse_listing(row) for row in rows] if isinstance(rows, list) else []
+    listings = [row for row in found if row is not None]
+
+    page: dict = {}
+    for key, out in (("total", "total"), ("page", "page"), ("totalPages", "pages")):
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            page[out] = value
+    return listings, page
+
+
+def as_pack(listing: Listing) -> Pack:
+    """A registry hit in the shape `same_pack` compares, so the two can be asked about
+    each other. The registry id *is* the `[project] name` a pack writes into its own
+    `pyproject.toml`, which is what makes that comparison exact rather than a guess."""
+    return Pack(
+        name=listing.name or listing.id,
+        registry_id=listing.id,
+        version=listing.version,
+        repo=listing.repo,
+        dependencies=list(listing.dependencies),
+    )
+
+
+def find_packs(packs: list[Pack], query: str) -> list[Pack]:
+    """Every installed pack a caller could mean by `query`, exact matches first.
+
+    Naming a pack is harder than it looks and getting it wrong is silent: the registry
+    calls it `comfyui-kjnodes`, `pyproject.toml` agrees, the folder on this machine is
+    `comfyui-kjnodes` and on the next one `ComfyUI-KJNodes`, and the person says
+    "kjnodes". An exact match on either machine-readable identity wins outright; a
+    substring is the fallback and returns everything it matched rather than picking,
+    because guessing between two packs is how the wrong one gets disabled.
+    """
+    want = normalise(query)
+    if not want:
+        return []
+
+    exact = [p for p in packs if want in {normalise(p.name), normalise(p.registry_id)}]
+    if not exact and "/" in query:
+        key = repo_key(query)
+        exact = [p for p in packs if p.repo and repo_key(p.repo) == key]
+    if exact:
+        return exact
+    return [p for p in packs if want in normalise(p.name) or want in normalise(p.registry_id)]
+
+
+def conflicts(packs: list[Pack], candidate: Pack) -> list[Pack]:
+    """The installed packs that would collide with `candidate` - **enabled ones only**.
+
+    A disabled copy is not a conflict, and that is not a nicety: measured on this
+    install, `ComfyUI-WanVideoWrapper` is present twice, enabled and as a disabled
+    `@nightly` checkout, both carrying the same registry id. A duplicate check counting
+    the second would refuse to touch the pack the user actually runs, and the reason
+    would be a folder they deliberately switched off.
+
+    What makes a real collision is two copies *registering the same class names*, which
+    ComfyUI resolves as whichever imported last - and a disabled pack imports never.
+    """
+    return [p for p in packs if p.enabled and same_pack(p, candidate)]
+
+
+def toggle_target(root, pack: Pack, enable: bool):
+    """Where turning `pack` on or off moves it, following ComfyUI-Manager exactly.
+
+    **Manager reads two spellings and writes one, and that asymmetry is the whole
+    rule.** Disabling a directory always produces `custom_nodes/.disabled/<name>` -
+    `unified_manager` moves it there and never writes the older `<name>.disabled`
+    form. Enabling looks for both, in that order, because installs made years apart
+    are still out there. A single `.py` pack is the exception in both directions:
+    there is nowhere to move a file to, so it is renamed in place with the suffix,
+    which is what Manager's `copy_set_active` does - and its name carries the `.py`,
+    because `Pack.name` is the entry as it sits on disk rather than a display name.
+
+    Agreeing here is the point of the function. A pack this server calls enabled while
+    Manager's UI calls it disabled is a disagreement the user meets as a node that is
+    on the canvas and does not work.
+    """
+    name = pack.name
+    if not pack.files:
+        current = root / name
+        hidden = root / f"{name}{DISABLED_SUFFIX}"
+        return (hidden, current) if enable else (current, hidden)
+
+    in_dir = root / DISABLED_DIR / name
+    suffixed = root / f"{name}{DISABLED_SUFFIX}"
+    if enable:
+        source = in_dir if in_dir.exists() else suffixed
+        return source, root / name
+    return root / name, in_dir
+
+
+def update_available(installed: Pack, listing: Listing) -> bool:
+    """Whether the registry knows a version this pack is not on.
+
+    A string comparison, deliberately. A pack's version is whatever its author typed
+    into `pyproject.toml`, and the ones here carry `1.5.0`, `2.0.0`, `0.1` and nine
+    empty strings. Ordering those needs a rule none of them agreed to, so the question
+    asked is "is it the same one", and the answer to "is it newer" is the two version
+    strings printed side by side for a person to read.
+    """
+    if not listing.version or not installed.version:
+        return False
+    return normalise(installed.version) != normalise(listing.version)
+
+
+CUSTOM_NODE_MODULE = "custom_nodes."
+
+NODE_TYPES_SHOWN = 20
+
+
+def pack_of_module(python_module: str) -> str:
+    """The custom_nodes folder a registered node type came from, or "" for a core node.
+
+    `/object_info` carries `python_module` on every entry, and on this install it is
+    exactly `custom_nodes.<folder name>` - 208 distinct modules across 2823 types.
+    That is the join between the three sources this concept reads: the disk says what
+    is installed, `/object_info` says what registered, and until this field there was
+    no way to say *which pack* a registered type belonged to, so the two could only be
+    counted against each other rather than compared.
+
+    Core nodes report `nodes` or `comfy_extras.nodes_*` and answer "" here.
+    """
+    text = python_module.strip()
+    if not text.startswith(CUSTOM_NODE_MODULE):
+        return ""
+    return text[len(CUSTOM_NODE_MODULE) :].split(".", 1)[0]
+
+
+def registered_by(schemas: dict, pack: Pack) -> list[str]:
+    """The node types `pack` actually registered, out of a whole `/object_info` payload.
+
+    The question this answers is the one a caller really has: a pack that is installed
+    and enabled and registers nothing did not merely fail to load - it failed in a way
+    that leaves every workflow using it with holes where its nodes were, and nothing on
+    the canvas says why. `get_comfy_log` says why; this says that.
+    """
+    want = normalise(pack.name)
+    found = []
+    for name, entry in schemas.items():
+        if not isinstance(entry, dict):
+            continue
+        owner = pack_of_module(str(entry.get("python_module", "")))
+        if owner and normalise(owner) == want:
+            found.append(str(name))
+    return sorted(found)

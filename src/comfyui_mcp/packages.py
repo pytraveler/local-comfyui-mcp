@@ -250,14 +250,28 @@ def _resolve_failure(output: str) -> str:
 class Uv:
     """uv, pointed at one interpreter. Everything that touches packages goes through here."""
 
-    def __init__(self, uv: Path, python: Path, timeout: float, index_url: str = "") -> None:
+    def __init__(
+        self,
+        uv: Path,
+        python: Path,
+        timeout: float,
+        index_url: str = "",
+        default_index: str = "",
+    ) -> None:
         self.uv = uv
         self.python = python
         self.timeout = timeout
         self.index_url = index_url
+        self.default_index = default_index.strip()
 
     def _base(self, *verb: str) -> list[str | Path]:
-        return [self.uv, "pip", *verb, "--no-config", "--python", self.python]
+        """`--no-config` so a `uv.toml` anywhere above the install cannot redirect an
+        install this server is reporting on, and `--default-index` only when somebody
+        has set one."""
+        argv: list[str | Path] = [self.uv, "pip", *verb, "--no-config", "--python", self.python]
+        if self.default_index:
+            argv += ["--default-index", self.default_index]
+        return argv
 
     def _index(self) -> list[str]:
         """The extra index a `+cuXXX` build needs, and the strategy that reaches it.
@@ -637,6 +651,97 @@ def read_packs(cfg: Config) -> list[E.Pack]:
             pass
 
     return sorted(found, key=lambda p: E.normalise(p.name))
+
+
+RESTART_NEEDED = (
+    "ComfyUI imports every custom node once at startup and never re-reads them, so this "
+    "changes nothing until it restarts - restart_comfy does that."
+)
+
+DEPENDENCIES_STAY = (
+    "Disabling moves the folder and nothing else: the pack's Python packages stay "
+    "installed, and so does anything else that came in with them. That is deliberate - "
+    "they are shared, and uninstalling one pack's requirements routinely takes another "
+    "pack's with them. restore_checkpoint is the tool that moves packages."
+)
+
+
+def custom_nodes_dir(cfg: Config) -> Path:
+    return cfg.comfy_dir / "custom_nodes"
+
+
+def pack_location(cfg: Config, pack: E.Pack) -> Path | None:
+    """Where this pack's files are right now, whichever spelling put them there.
+
+    All three are checked rather than the one its `enabled` flag implies, because the
+    flag came from a read that may be minutes old and a Manager running in the same
+    ComfyUI can have moved the folder in between.
+    """
+    root = custom_nodes_dir(cfg)
+    for candidate in (
+        root / pack.name,
+        root / E.DISABLED_DIR / pack.name,
+        root / f"{pack.name}{E.DISABLED_SUFFIX}",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def toggle_pack(cfg: Config, pack: E.Pack, enable: bool) -> tuple[Path, Path]:
+    """Move a pack between enabled and disabled, and report where it went.
+
+    One `rename` within one directory, which is what makes this the safest tool in the
+    concept: it is atomic on both platforms, it copies nothing, and it is undone by
+    calling it again with the other argument. Nothing here writes to the pack itself.
+
+    **`rename` is used rather than `shutil.move` precisely because it refuses to
+    overwrite.** A pack present in both places at once is a state Manager can produce
+    (install, disable, install again), and silently replacing one copy with the other
+    would destroy a checkout that may hold local edits - the folders in custom_nodes
+    are the user's, which is the same reason a checkpoint never copies them.
+
+    The `.disabled` directory is created on demand: a portable install that has never
+    disabled anything does not have one, and that is the common case rather than a
+    fault.
+
+    **A running ComfyUI is usually not in the way, and the obvious reason it would be
+    is wrong.** Measured on Windows 11: renaming a directory holding a *loaded* `.pyd`
+    succeeds - the module loader opens it with `FILE_SHARE_DELETE`, so the mapping does
+    not pin the path. What does refuse is an ordinary open handle, which is what
+    `open()` produces by default: a pack's log, cache or database, held for as long as
+    it runs. So this is attempted rather than pre-refused, and a failure is reported
+    with the fix (stop ComfyUI) rather than being predicted.
+    """
+    root = custom_nodes_dir(cfg)
+    if not root.is_dir():
+        raise PackageError(f"{root} is not a directory, so there is nothing to enable or disable.")
+
+    source, target = E.toggle_target(root, pack, enable)
+    if not source.exists():
+        state = "disabled" if enable else "enabled"
+        raise PackageError(
+            f"{pack.name} is not {state}: nothing at {source}. Read describe_environment "
+            "for the packs that are actually installed."
+        )
+    if target.exists():
+        raise PackageError(
+            f"refusing to move {source} onto {target}, which already exists. Both copies of "
+            f"{pack.name} are on disk - one enabled and one disabled - and this server will "
+            "not choose which of them to destroy. Remove or rename the one you do not want."
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        source.rename(target)
+    except OSError as exc:
+        raise PackageError(
+            f"could not move {source} to {target}: {exc}. On Windows that is what a file "
+            "still open inside the folder looks like - a log, a cache, a database a pack "
+            "keeps open while it runs. Stopping ComfyUI closes them: comfy_stop, then call "
+            "again. Compiled extensions are not the problem, whatever it looks like."
+        ) from exc
+    return source, target
 
 
 @dataclass

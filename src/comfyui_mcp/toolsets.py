@@ -10,7 +10,7 @@ then lies about itself.
 
 Three reasons this exists, and only the last is about safety:
 
-*Context.* All 57 schemas reach the model at the start of every session. Somebody
+*Context.* All 60 schemas reach the model at the start of every session. Somebody
 who only ever runs workflow files pays for twenty canvas tools they never call.
 
 *The decision is made when nobody is in a hurry.* A permission prompt raised in
@@ -286,6 +286,58 @@ GROUPS: tuple[Group, ...] = (
         ),
     ),
     Group(
+        name="extensions",
+        title=Text(en="Extensions: reading", ru="Расширения: чтение"),
+        risk="reads",
+        summary=Text(
+            en=(
+                "Searching the Comfy Registry, and reporting what one installed node pack is, "
+                "where it came from and whether its nodes actually load."
+            ),
+            ru=(
+                "Поиск по Comfy Registry и рассказ о том, что представляет собой установленный "
+                "пак нод, откуда он взялся и загружаются ли вообще его ноды."
+            ),
+        ),
+        warning=Text(
+            en=(
+                "Read-only, and the half that answers before anything is downloaded: a registry "
+                "entry carries the pack's own dependency list, so plan_packages can be asked "
+                "what installing it would move while nothing is on disk yet. It reaches "
+                "api.comfy.org, a host separate from both ComfyUI and PyPI."
+            ),
+            ru=(
+                "Только чтение, и та половина, которая отвечает до того, как что-то скачано: в "
+                "записи реестра лежит собственный список зависимостей пака, так что plan_packages "
+                "можно спросить, что сдвинет установка, пока на диске ещё ничего нет. Ходит на "
+                "api.comfy.org - хост, отдельный и от ComfyUI, и от PyPI."
+            ),
+        ),
+    ),
+    Group(
+        name="extensions_manage",
+        title=Text(en="Extensions: enabling and disabling", ru="Расширения: включение и выключение"),
+        risk="writes",
+        summary=Text(
+            en="Turning an installed node pack off and on again, the way ComfyUI-Manager does.",
+            ru="Выключение и обратное включение установленного пака нод - так же, как это делает ComfyUI-Manager.",
+        ),
+        warning=Text(
+            en=(
+                "One rename inside custom_nodes: nothing is downloaded, no package moves, and "
+                "the same call with the other value puts it back. This is the fix when a pack "
+                "breaks ComfyUI's startup, and it is the one that still works then - it needs "
+                "neither a running ComfyUI nor a network."
+            ),
+            ru=(
+                "Одно переименование внутри custom_nodes: ничего не качается, ни один пакет не "
+                "двигается, а тот же вызов с другим значением возвращает всё назад. Это лечение "
+                "для пака, который ломает запуск ComfyUI, и именно оно тогда и работает - ему не "
+                "нужны ни запущенная ComfyUI, ни сеть."
+            ),
+        ),
+    ),
+    Group(
         name="process",
         title=Text(en="Process and tab", ru="Процесс и вкладка"),
         risk="process",
@@ -316,6 +368,28 @@ _NO_POLL = Text(
 )
 
 DEPENDS: tuple[tuple[str, tuple[str, ...], Text], ...] = (
+    (
+        "set_extension_enabled",
+        ("describe_environment", "describe_extension"),
+        Text(
+            en="packs can be switched on and off with nothing that says which ones are installed",
+            ru="паки можно включать и выключать, но ничто не говорит, какие вообще установлены",
+        ),
+    ),
+    (
+        "set_extension_enabled",
+        ("restart_comfy",),
+        Text(
+            en=(
+                "ComfyUI imports custom nodes once at startup, so the change does not take "
+                "effect and nothing here can make it"
+            ),
+            ru=(
+                "ComfyUI импортирует кастомные ноды один раз при старте, так что изменение не "
+                "вступит в силу, и применить его отсюда будет нечем"
+            ),
+        ),
+    ),
     ("run_workflow", ("get_progress",), _NO_POLL),
     ("run_workspace", ("get_progress",), _NO_POLL),
     (

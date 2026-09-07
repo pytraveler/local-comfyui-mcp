@@ -27,6 +27,7 @@ from . import graph as G
 from . import i18n
 from . import logs as L
 from . import packages as P
+from . import registry as R
 from . import store
 from . import toolsets as T
 from .bridge import BridgeClient, WorkspaceError, WorkspaceUnavailable
@@ -3655,6 +3656,16 @@ async def _environment(require_confirmation: bool = False) -> Environment:
     return env
 
 
+def _uv(uv_exe, python, timeout: float, torch_index: str = "") -> P.Uv:
+    """uv pointed at ComfyUI's interpreter, carrying whichever indexes are configured.
+
+    One place, because `COMFYUI_PACKAGE_INDEX` has to reach *every* uv call or the
+    reports disagree with the installs: a plan resolved against PyPI and an install
+    performed against a mirror are two different answers to one question.
+    """
+    return P.Uv(uv_exe, python, timeout, torch_index, CFG.package_index)
+
+
 async def _comfyui_version() -> str:
     """ComfyUI's version, from the running instance or from its own source file.
 
@@ -3699,7 +3710,7 @@ async def describe_environment(packages: bool = False) -> dict[str, Any]:
             counts plus `pinned` are what a caller normally needs.
     """
     env = await _environment()
-    uv = P.Uv(env.uv, env.python, CFG.package_timeout)
+    uv = _uv(env.uv, env.python, CFG.package_timeout)
     try:
         pins = await uv.freeze()
         packs = P.read_packs(CFG)
@@ -3730,6 +3741,7 @@ async def describe_environment(packages: bool = False) -> dict[str, Any]:
         "pinned": [p.line for p in pins if p.name in E.PINNED_FAMILY],
         "unrestorable": [p.line for p in unrestorable],
         "torch_index": E.torch_index_url(pins),
+        "package_index": CFG.package_index or "https://pypi.org/simple (uv's default)",
         "custom_nodes": {
             "installed": len(packs),
             "disabled": disabled,
@@ -3784,8 +3796,8 @@ async def plan_packages(requirements: list[str], upgrade: bool = False) -> dict[
 
     env = await _environment()
     try:
-        pins = await P.Uv(env.uv, env.python, CFG.package_timeout).freeze()
-        uv = P.Uv(env.uv, env.python, CFG.package_timeout, E.torch_index_url(pins))
+        pins = await _uv(env.uv, env.python, CFG.package_timeout).freeze()
+        uv = _uv(env.uv, env.python, CFG.package_timeout, E.torch_index_url(pins))
         plan = await uv.dry_run(requirements, upgrade=upgrade)
     except P.PackageError as exc:
         raise ComfyError(str(exc)) from exc
@@ -3798,7 +3810,14 @@ async def plan_packages(requirements: list[str], upgrade: bool = False) -> dict[
         "additive_only": E.plan_is_additive(plan),
         "refused": bool(risks),
         "risks": [{"package": r.name, "rule": r.rule, "detail": r.detail} for r in risks],
+        "index": CFG.package_index or "https://pypi.org/simple (uv's default)",
     }
+    if CFG.package_index:
+        out["index_note"] = (
+            "COMFYUI_PACKAGE_INDEX points somewhere other than PyPI, so this plan - and any "
+            "install following it - resolves against that host and takes its bytes from "
+            "there. Whoever set it is trusted with what gets installed."
+        )
     if plan.no_changes:
         out["hint"] = "Everything asked for is already installed at a satisfying version."
     elif risks:
@@ -3837,7 +3856,7 @@ async def audit_packages(limit: int = 40) -> dict[str, Any]:
         limit: how many affected packages to list, worst first.
     """
     env = await _environment()
-    uv = P.Uv(env.uv, env.python, CFG.package_timeout)
+    uv = _uv(env.uv, env.python, CFG.package_timeout)
     try:
         pins = await uv.freeze()
         raw = await P.audit(env.uv, env.python, CFG.audit_timeout, _scratch())
@@ -3885,7 +3904,7 @@ async def create_checkpoint(note: str = "") -> dict[str, Any]:
             hard to tell from the four beside it a month later.
     """
     env = await _environment()
-    uv = P.Uv(env.uv, env.python, CFG.package_timeout)
+    uv = _uv(env.uv, env.python, CFG.package_timeout)
     try:
         pins = await uv.freeze()
         packs = P.read_packs(CFG)
@@ -4004,7 +4023,7 @@ async def restore_checkpoint(
         if problem:
             raise ComfyError(f"refusing to restore into {python}: {problem}")
 
-    uv = P.Uv(uv_exe, python, CFG.package_timeout, str(checkpoint.manifest.get("torch_index", "")))
+    uv = _uv(uv_exe, python, CFG.package_timeout, str(checkpoint.manifest.get("torch_index", "")))
     listing = _scratch() / f"restore-{checkpoint.name}.txt"
     listing.parent.mkdir(parents=True, exist_ok=True)
 
@@ -4114,6 +4133,220 @@ def _scratch() -> Path:
     path = P.checkpoints_dir(CFG) / ".work"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _resolve_pack(query: str) -> E.Pack:
+    """The one installed pack a caller means, or a refusal naming the candidates.
+
+    Ambiguity is refused rather than resolved. Every tool below acts on a folder, and
+    picking between two packs whose names both contain the query is how the wrong one
+    gets moved - with a reply that looks entirely successful.
+    """
+    packs = P.read_packs(CFG)
+    hits = E.find_packs(packs, query)
+    if not hits:
+        raise ComfyError(
+            f"no installed pack matches {query!r}. describe_environment lists all "
+            f"{len(packs)} of them, disabled ones included; search_extensions is for "
+            "packs that are not installed yet."
+        )
+    if len(hits) > 1:
+        names = ", ".join(sorted(p.name for p in hits))
+        raise ComfyError(
+            f"{query!r} matches {len(hits)} installed packs: {names}. Name one of them "
+            "exactly - this server will not pick, because acting on the wrong pack "
+            "looks exactly like acting on the right one."
+        )
+    return hits[0]
+
+
+async def _listing_for(pack: E.Pack) -> E.Listing | None:
+    """The registry's entry for an installed pack, if it has one and the registry answers.
+
+    Never fatal. A pack cloned straight from GitHub was never published, and the whole
+    point of reading the disk is that it is the source that still works when nothing
+    else does - so a registry that is unreachable must not take a local read down
+    with it.
+    """
+    node_id = pack.registry_id or pack.name
+    try:
+        return await R.fetch(CFG, node_id)
+    except ComfyError:
+        return None
+
+
+@tool("extensions", "reads")
+async def search_extensions(query: str, limit: int = 10, page: int = 1) -> dict[str, Any]:
+    """Search the Comfy Registry for a node pack, and say which ones are already here.
+
+    **The registry answers before anything is cloned**, which is what makes this the
+    first step rather than a convenience: each hit carries the pack's own
+    `dependencies`, so `plan_packages` can be asked what installing it would move
+    while the pack is still a row in somebody else's database. Cloning a repository to
+    find out what it wants is the thing this ordering exists to avoid.
+
+    `installed` on a hit means an *enabled* copy of that same pack is already here,
+    compared by registry id and git remote rather than by folder name. A disabled copy
+    is reported separately, since it is not a conflict - it is a pack somebody
+    switched off, and re-installing over it is rarely what they meant.
+
+    This reaches api.comfy.org, which is a third host: it can answer while PyPI is
+    unreachable, and it can be down while ComfyUI is fine.
+
+    Args:
+        query: what to search for - a name, part of one, or a subject like "video".
+        limit: hits per page, at most 100.
+        page: which page of the result, 1-based. `total` says how many there are.
+    """
+    if not query.strip():
+        raise ComfyError("search_extensions needs something to search for.")
+
+    listings, paging = await R.search(CFG, query.strip(), limit, page)
+    installed = P.read_packs(CFG)
+
+    hits: list[dict[str, Any]] = []
+    for listing in listings:
+        row = listing.as_dict()
+        candidate = E.as_pack(listing)
+        clash = E.conflicts(installed, candidate)
+        if clash:
+            row["installed"] = clash[0].name
+            if clash[0].version:
+                row["installed_version"] = clash[0].version
+        else:
+            same = [p for p in installed if E.same_pack(p, candidate)]
+            if same:
+                row["installed_but_disabled"] = same[0].name
+        hits.append(row)
+
+    out: dict[str, Any] = {"query": query, "hits": hits, "registry": R.base_url(CFG)}
+    out.update(paging)
+    if not hits:
+        out["hint"] = (
+            "The registry knows nothing by that name. Plenty of packs are published on "
+            "GitHub and never registered, so this is not evidence that no such pack "
+            "exists - it is evidence that the registry cannot vouch for one."
+        )
+    return out
+
+
+@tool("extensions", "reads")
+async def describe_extension(name: str) -> dict[str, Any]:
+    """Everything known about one installed node pack: disk, registry, and whether it works.
+
+    Three sources, and the disagreements between them are the reason to ask. The disk
+    says what is installed and at which commit. The registry says what the current
+    version is, so `update_available` can be answered without a fetch. `/object_info`
+    says whether the pack's nodes actually registered - and a pack that is installed,
+    enabled, and registers nothing is a pack whose import died, which `get_comfy_log`
+    will say the reason for.
+
+    `dependencies` is what the pack declares in its own `pyproject.toml`. Hand it to
+    `plan_packages` to find out what repairing or updating this pack would move.
+
+    Args:
+        name: the pack, by folder name, registry id, or a distinctive part of either.
+            Ambiguity is refused rather than guessed at.
+    """
+    pack = _resolve_pack(name)
+    listing = await _listing_for(pack)
+
+    out: dict[str, Any] = {"pack": pack.as_dict(), "path": str(P.pack_location(CFG, pack) or "")}
+    if listing:
+        out["registry"] = listing.as_dict()
+        if E.update_available(pack, listing):
+            out["update_available"] = {"installed": pack.version, "registry": listing.version}
+    else:
+        out["registry"] = None
+        out["registry_note"] = (
+            "The registry has no entry under this pack's own id. That is ordinary - a pack "
+            "cloned from GitHub was never published - and it means no version check is "
+            "possible for it here."
+        )
+
+    if not pack.enabled:
+        out["hint"] = (
+            "This pack is disabled, so ComfyUI does not see it at all and its nodes are "
+            "absent from every workflow that uses them. set_extension_enabled turns it "
+            "back on."
+        )
+        return out
+
+    if not await CLIENT.is_alive():
+        out["registered"] = None
+        out["registered_note"] = (
+            "ComfyUI is not running, so nothing says whether this pack's nodes load. The "
+            "disk can only report that the files are there."
+        )
+        return out
+
+    try:
+        schemas = await _all_schemas()
+    except (ComfyError, httpx.HTTPError, OSError):
+        out["registered"] = None
+        return out
+
+    types = E.registered_by(schemas, pack)
+    out["registered"] = len(types)
+    out["node_types"] = types[: E.NODE_TYPES_SHOWN]
+    if len(types) > E.NODE_TYPES_SHOWN:
+        out["node_types_not_shown"] = len(types) - E.NODE_TYPES_SHOWN
+    if not types:
+        out["hint"] = (
+            f"{pack.name} is installed and enabled and has registered no node types at all, "
+            "which means its import failed - ComfyUI catches that and carries on, so nothing "
+            "on the canvas says so and every workflow using it simply has holes. "
+            "get_comfy_log is where the traceback is."
+        )
+    return out
+
+
+@tool("extensions_manage", "writes")
+async def set_extension_enabled(name: str, enabled: bool) -> dict[str, Any]:
+    """Turn an installed node pack on or off, the way ComfyUI-Manager does.
+
+    **The safest operation in this whole concept, and the one worth reaching for
+    first.** It is a single rename inside custom_nodes: nothing is downloaded, no
+    package moves, and calling it again with the other value puts everything back.
+    When a pack breaks ComfyUI's startup, this is the fix - and it is the fix that
+    still works then, because it needs neither ComfyUI nor a network, which is exactly
+    what Manager's own HTTP route cannot say.
+
+    Manager's two spellings are both honoured. Disabling writes what Manager 3.x
+    writes (`custom_nodes/.disabled/<name>`); enabling looks for that and for the older
+    `<name>.disabled` beside it, so a pack switched off years ago comes back.
+
+    A state, not a toggle: asking for the state a pack is already in is reported and
+    changes nothing, so a caller that is unsure does not flip it by accident.
+
+    Args:
+        name: the pack, by folder name, registry id, or a distinctive part of either.
+        enabled: True to turn it on, False to turn it off.
+    """
+    pack = _resolve_pack(name)
+    if pack.enabled == enabled:
+        return {
+            "pack": pack.name,
+            "enabled": pack.enabled,
+            "changed": False,
+            "hint": f"{pack.name} is already {'enabled' if enabled else 'disabled'}.",
+        }
+
+    try:
+        source, target = P.toggle_pack(CFG, pack, enabled)
+    except P.PackageError as exc:
+        raise ComfyError(str(exc)) from exc
+
+    out: dict[str, Any] = {
+        "pack": pack.name,
+        "enabled": enabled,
+        "changed": True,
+        "moved": {"from": str(source), "to": str(target)},
+        "restart": P.RESTART_NEEDED,
+    }
+    if not enabled:
+        out["packages"] = P.DEPENDENCIES_STAY
+    return out
 
 
 def main() -> None:
